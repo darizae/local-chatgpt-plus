@@ -7,7 +7,7 @@ tripwire `scripts/check-publication-content.mjs`.
 ## What the workflow does
 
 `release-security.yml` runs on `macos-latest` (the supported platform for this
-macOS-first project) on every push to `main` and via manual dispatch. It is a
+macOS-first project) on every push and pull request targeting `main`, and via manual dispatch. It is a
 local, self-contained gate: the job has `permissions: contents: read`, receives
 **no** repository secrets, and runs only the repository's own scripts and
 official GitHub Actions. It never uploads repository content to any third-party
