@@ -1,0 +1,81 @@
+{
+  "name": "local-chatgpt-plus",
+  "version": "1.0.0",
+  "description": "A self-hosted macOS MCP coding agent for ChatGPT with filesystem, shell, Git, and extensible agent workflows",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/darizae/local-chatgpt-plus.git"
+  },
+  "homepage": "https://github.com/darizae/local-chatgpt-plus#readme",
+  "bugs": {
+    "url": "https://github.com/darizae/local-chatgpt-plus/issues"
+  },
+  "author": "darizae",
+  "contributors": [
+    "hoangcoderr (original author)"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "local-chatgpt-plus": "dist/index.js"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "fsevents@2.3.3": true,
+    "node-pty@1.1.0": true
+  },
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "scripts": {
+    "postinstall": "node scripts/fix-node-pty-permissions.mjs",
+    "build": "tsc",
+    "test": "tsc && node scripts/test-mcp-empty-token-startup.mjs && node scripts/test-admin-session-security.mjs && node scripts/test-admin-request-origin.mjs && node scripts/test-admin-env-security.mjs && node scripts/test-computer-approval.mjs && node scripts/test-mcp-bridge-security.mjs && node scripts/test-computer-use.mjs && node scripts/test-state-durability.mjs && node scripts/test-skills-loader.mjs && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-mcp-oauth.mjs && node scripts/test-inbound-oauth.mjs && node scripts/test-oauth-session-recovery.mjs && node scripts/test-activity-log.mjs && node scripts/test-sanitize-activity.mjs && node scripts/test-orchestration.mjs && node scripts/test-omp-output.mjs && node scripts/test-omp-browser-relay.mjs && node scripts/test-omp-browser-relay-cdp.mjs && node scripts/test-project-memory.mjs && node scripts/test-path-rules.mjs && node scripts/test-project-memory-bounded.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs && node scripts/test-agent-task.mjs && node scripts/test-task-execution.mjs && node scripts/test-agent-runtime.mjs && node scripts/test-phase2-runtime.mjs && node scripts/test-phase3-runtime.mjs && node scripts/test-context-capsule.mjs && node scripts/test-modern-tools.mjs && node scripts/test-permissions-hooks.mjs && node scripts/test-subagents.mjs && node scripts/test-delegates.mjs && node scripts/test-runtime-dashboard.mjs && node scripts/test-tui-resize-live.mjs && node scripts/test-tui-interactive.mjs && node scripts/test-dashboard-tunnel-status.mjs && node scripts/test-admin-ui.mjs && node scripts/test-action-glossary.mjs && node scripts/test-admin-recovery.mjs && node scripts/test-audit-rotation.mjs && node scripts/test-audit-metrics.mjs && node scripts/test-server-lifecycle.mjs && node scripts/test-lcp-controller.mjs && node scripts/test-phase4-production.mjs && node scripts/test-phase5-efficiency.mjs && node scripts/test-context-prefix.mjs && node scripts/test-phase6.mjs && node scripts/test-macos-optimizations.mjs",
+    "test:all": "node scripts/run-all-tests.mjs",
+    "test:integration": "tsc && node scripts/test-mcp-bridge-integration.mjs",
+    "test:phase4": "tsc && node scripts/test-phase4-production.mjs",
+    "test:phase5": "tsc && node scripts/test-phase5-efficiency.mjs",
+    "test:phase6": "tsc && node scripts/test-phase6.mjs",
+    "test:smoke": "tsc && AUDIT_LOG_PATH=\"$(mktemp -t lcp-smoke-XXXX)/audit.log\" node scripts/smoke-security-check.mjs",
+    "benchmark": "node scripts/benchmark-performance.mjs",
+    "benchmark:agent": "npm run test:phase4",
+    "check:deps": "node scripts/check-dependency-versions.mjs",
+    "init-claude-md": "node scripts/init-claude-md.mjs",
+    "prestart": "node scripts/build-if-needed.mjs",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "tunnel": "cloudflared tunnel --url http://localhost:3000"
+  },
+  "keywords": [
+    "mcp",
+    "chatgpt",
+    "coding-agent",
+    "model-context-protocol",
+    "local-development",
+    "filesystem",
+    "git",
+    "apply-patch",
+    "developer-mode",
+    "openai-tunnel"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.3.0",
+    "jose": "^6.2.18",
+    "node-pty": "^1.1.0",
+    "pyright": "^1.1.414",
+    "typescript-language-server": "^6.1.0",
+    "typescript-lsp": "npm:typescript@^6.0.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.11",
+    "typescript": "^7.0.2"
+  }
+}

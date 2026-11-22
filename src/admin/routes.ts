@@ -1,0 +1,833 @@
+import fs from "fs/promises";
+import path from "path";
+import { Router, type Request, type Response } from "express";
+import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
+import {
+  defaultUpstreamConfig,
+  computerUseMcpPresets,
+  discoverMcpConfigs,
+  findMcpConfigForSource,
+  importMcpConfigFromFile,
+  type McpImportSource,
+  type UpstreamConfigFile,
+  type UpstreamServerConfig,
+} from "../lib/mcp-upstream-config.js";
+import { publicUpstreamConfig, mergeUpstreamSecretPlaceholders } from "./redact-config.js";
+import { getDefaultCwd, getFullDiskAccess, validatePath } from "../lib/path-security.js";
+import {
+  getSkillControls, loadProjectSkills, saveSkillControls, setSkillEnabled,
+  type SkillControlScope,
+} from "../lib/skills-loader.js";
+import { getCheckpointConfig } from "../lib/checkpoint.js";
+import { getCodexHooks, saveCodexHooks } from "../lib/codex-hooks.js";
+import {
+  describePermissionProfile,
+  getPermissionConfig,
+  getPermissionConfigPath,
+  savePermissionConfig,
+} from "../lib/permissions.js";
+import {
+  getLocalHooksConfig,
+  getLocalHooksConfigPath,
+  saveLocalHooksConfig,
+} from "../lib/local-hooks.js";
+import {
+  getSubagentConfig,
+  getSubagentConfigPath,
+  listSubagents,
+  saveSubagentConfig,
+} from "../lib/subagent-manager.js";
+import { getRuntimeSnapshot } from "../lib/runtime-state.js";
+import { getPersistentAuditMetrics } from "../lib/audit-metrics.js";
+import { getRuntimeIdentity } from "../lib/runtime-identity.js";
+import {
+  getWorker,
+  listWorkers,
+  reconcileOwnedWorkers,
+  updateWorkerStatus,
+} from "../lib/worker-registry.js";
+import { buildOrchestrationReadiness, type OrchestrationReadiness } from "../lib/orchestration-readiness.js";
+import { stopSubagent } from "../lib/subagent-manager.js";
+import { getProjectAffinity } from "../lib/project-affinity.js";
+import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js";
+import { taskExecutionContext, taskWithExecution } from "../lib/task-execution-context.js";
+import { buildWorkspaceRecoveryReview } from "../lib/recovery-review.js";
+import { listOperationHistory } from "../lib/operation-store.js";
+import { listEditTransactions } from "../lib/edit-transaction-store.js";
+import { getCodingLoopStateErrors, listCodingLoops } from "../lib/coding-loop-store.js";
+import {
+  compactContextCapsule,
+  getContextCapsuleStateErrors,
+  listContextCapsules,
+} from "../lib/context-capsule-store.js";
+import { getManagedProcessSnapshot } from "../tools/shell.js";
+import { getPtySessionSnapshot } from "../tools/pty.js";
+import {
+  LOCAL_TOOL_CATALOG,
+  getLocalToolOverrides,
+  saveLocalToolOverrides,
+} from "../lib/tool-profile.js";
+import {
+  getRecentActivity,
+  loadAuditHistory,
+  subscribeActivity,
+  type ActivityEntry,
+} from "../lib/activity-log.js";
+import type { SessionRuntimeState } from "../lib/session-context.js";
+import type { TunnelSnapshot } from "../lib/tunnel-supervisor.js";
+import { createDashboardTunnelResolver } from "../lib/dashboard-tunnel-status.js";
+import { atomicWriteText } from "../lib/atomic-file.js";
+import type { WorkerRecord } from "../lib/worker-registry.js";
+
+function publicAdminWorker(worker: WorkerRecord): WorkerRecord {
+  return {
+    ...worker,
+    objective: worker.objective ? "[objective withheld]" : undefined,
+    reason: worker.reason ? "[worker details withheld]" : undefined,
+  };
+}
+
+function parseDotEnv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const idx = trimmed.indexOf("=");
+    if (idx < 0) continue;
+    const key = trimmed.slice(0, idx).trim();
+    let value = trimmed.slice(idx + 1).trim();
+    value = value.replace(/^['"]|['"]$/g, "");
+    out[key] = value;
+  }
+  return out;
+}
+
+// Omit secret-valued keys in Admin responses: masks must never round-trip as values.
+const SENSITIVE_ENV_KEY = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|API_KEY|PRIVATE_KEY|ACCESS_KEY|SESSION_KEY|COOKIE|CREDENTIAL|CLIENT_SECRET|BEARER)(?:_|$)/i;
+function isSensitiveEnvKey(key: string): boolean {
+  return SENSITIVE_ENV_KEY.test(key) || /(?:SECRET|PASSWORD|APIKEY|TOKEN)$/i.test(key);
+}
+function publicDotEnvValues(values: Record<string, string>): { values: Record<string, string>; redacted_keys: string[] } {
+  const safe: Record<string, string> = {};
+  const redacted: string[] = [];
+  for (const [key, value] of Object.entries(values)) {
+    if (isSensitiveEnvKey(key)) redacted.push(key);
+    else safe[key] = value;
+  }
+  return { values: safe, redacted_keys: redacted };
+}
+
+function serializeDotEnv(values: Record<string, string>, original: string): string {
+  const lines = original.split("\n");
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) {
+      result.push(line);
+      continue;
+    }
+    const key = trimmed.split("=")[0].trim();
+    if (key in values) {
+      result.push(`${key}=${values[key]}`);
+      seen.add(key);
+    } else {
+      result.push(line);
+    }
+  }
+
+  for (const [key, value] of Object.entries(values)) {
+    if (!seen.has(key)) result.push(`${key}=${value}`);
+  }
+
+  return result.join("\n");
+}
+
+export function createAdminRouter(manager: McpUpstreamManager, options: {
+  mcpPort: number;
+  pid: number;
+  transportMode: "sse" | "json";
+  keepAliveMs: number;
+  sessionCount: () => number;
+  sessionSnapshot?: () => SessionRuntimeState[];
+  tunnelSnapshot?: () => TunnelSnapshot;
+  instructionSummary?: () => Record<string, unknown>;
+  instructionsPreview?: () => string;
+}): Router {
+  const router = Router();
+  const dashboardTunnel = createDashboardTunnelResolver(options.mcpPort);
+  const envPath = path.resolve(process.cwd(), ".env");
+  let envMutationQueue: Promise<void> = Promise.resolve();
+
+  // The admin server is created at process bootstrap, before any MCP tool call can
+  // register a worker in THIS process. Reconcile exactly once here so workers left
+  // "running" by a previous process are honestly marked interrupted without racing a
+  // genuinely live subagent spawned later in this process.
+  void reconcileOwnedWorkers().catch(() => undefined);
+
+  router.get("/health", async (_req: Request, res: Response) => {
+    const upstream = await manager.listStatuses();
+    res.json({
+      status: "ok",
+      name: "local-chatgpt-plus-admin",
+      pid: options.pid,
+      mcp_port: options.mcpPort,
+      transport_mode: options.transportMode,
+      sse_keepalive_ms: options.transportMode === "sse" ? options.keepAliveMs : null,
+      active_sessions: options.sessionCount(),
+      sessions: options.sessionSnapshot?.() ?? [],
+      tunnel: await dashboardTunnel(options.tunnelSnapshot?.() ?? null),
+      default_cwd: getDefaultCwd(),
+      full_disk_access: getFullDiskAccess(),
+      permission: describePermissionProfile(),
+      upstream,
+      checkpoint: getCheckpointConfig(),
+      instructions: options.instructionSummary?.() ?? null,
+    });
+  });
+
+  router.get("/api/runtime", async (_req, res) => {
+    const memory = process.memoryUsage();
+    const subagents = listSubagents().map(({ stdout: _stdout, stderr: _stderr, ...item }) => item);
+    const processes = getManagedProcessSnapshot();
+    const activeProcessIds = new Set(processes.filter((item) => item.running).map((item) => item.id));
+    const [tasksResult, operationsResult, transactionsResult, loopsResult, capsulesResult, auditMetricsResult] = await Promise.allSettled([
+      listAgentTasks(),
+      listOperationHistory({ limit: 12, active_ids: activeProcessIds }),
+      listEditTransactions(12),
+      listCodingLoops(12),
+      listContextCapsules(12),
+      getPersistentAuditMetrics(),
+    ]);
+    const tasks = tasksResult.status === "fulfilled" ? tasksResult.value : [];
+    const operations = operationsResult.status === "fulfilled" ? operationsResult.value : [];
+    const editTransactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
+    const codingLoops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
+    const contextCapsules = capsulesResult.status === "fulfilled" ? capsulesResult.value : [];
+    const auditMetrics = auditMetricsResult.status === "fulfilled" ? auditMetricsResult.value : null;
+    const projectAffinity = await getProjectAffinity(getDefaultCwd()).catch(() => ({ active_root: null, active_alias: null, recents: [] }));
+    let orchestrationReadiness: OrchestrationReadiness | null = null;
+    try {
+      const subagentConfig = await getSubagentConfig();
+      const permission = getPermissionConfig();
+      let executableResolvable = false;
+      if (subagentConfig.enabled && subagentConfig.executable) {
+        executableResolvable = await fs.access(subagentConfig.executable).then(() => true).catch(() => false);
+      }
+      orchestrationReadiness = buildOrchestrationReadiness({
+        subagentConfig,
+        upstreamServers: manager.getConfig().servers ?? [],
+        allowUnsafeRuntimes: permission.profile === "open" || permission.allow_unsafe_runtimes === true,
+        permissionProfile: permission.profile,
+        subagentExecutableResolvable: executableResolvable,
+      });
+    } catch {}
+    const workers = (await listWorkers()).map(publicAdminWorker);
+    const executionContext = await taskExecutionContext();
+    const agentTasks = await Promise.all(tasks.slice(0, 8).map((task) => taskWithExecution(task, executionContext)));
+    res.json({
+      ok: true,
+      identity: getRuntimeIdentity(),
+      sessions: options.sessionSnapshot?.() ?? [],
+      tunnel: await dashboardTunnel(options.tunnelSnapshot?.() ?? null),
+      project_affinity: projectAffinity,
+      runtime: getRuntimeSnapshot(),
+      processes: processes.map((proc) => ({ ...proc, command: "[command withheld]" })),
+      ptys: getPtySessionSnapshot(),
+      subagents,
+      workers,
+      orchestration_readiness: orchestrationReadiness,
+      agent_tasks: agentTasks,
+      operations,
+      edit_transactions: editTransactions.map((transaction) => ({
+        id: transaction.id,
+        session_id: transaction.session_id,
+        label: transaction.label,
+        workspace: transaction.workspace,
+        status: transaction.status,
+        created_at: transaction.created_at,
+        updated_at: transaction.updated_at,
+        files: transaction.snapshots.length,
+        edits: transaction.edits.length,
+        verification: transaction.verification
+          ? {
+              at: transaction.verification.at,
+              preset: transaction.verification.preset,
+              passed: transaction.verification.passed,
+              failed: transaction.verification.failed,
+            }
+          : null,
+      })),
+      coding_loops: codingLoops.map((loop) => ({
+        id: loop.id,
+        session_id: loop.session_id,
+        goal: loop.goal,
+        task_id: loop.task_id,
+        status: loop.status,
+        phase: loop.phase,
+        workspace: loop.workspace,
+        source_workspace: loop.source_workspace,
+        transaction_id: loop.transaction_id,
+        attempts: loop.attempts.length,
+        max_attempts: loop.max_attempts,
+        last_attempt: loop.attempts.at(-1) ?? null,
+        isolation: loop.isolation,
+        updated_at: loop.updated_at,
+      })),
+      context_capsules: contextCapsules.map(compactContextCapsule),
+      persistent_telemetry: auditMetrics,
+      state_errors: [
+        ...(tasksResult.status === "rejected" ? [`agent_tasks: ${String(tasksResult.reason)}`] : []),
+        ...(operationsResult.status === "rejected" ? [`operations: ${String(operationsResult.reason)}`] : []),
+        ...(transactionsResult.status === "rejected" ? [`edit_transactions: ${String(transactionsResult.reason)}`] : []),
+        ...(loopsResult.status === "rejected" ? [`coding_loops: ${String(loopsResult.reason)}`] : []),
+        ...(loopsResult.status === "fulfilled" ? getCodingLoopStateErrors().map((error) => `coding_loops: ${error}`) : []),
+        ...(capsulesResult.status === "rejected" ? [`context_capsules: ${String(capsulesResult.reason)}`] : []),
+        ...(capsulesResult.status === "fulfilled" ? getContextCapsuleStateErrors().map((error) => `context_capsules: ${error}`) : []),
+        ...(auditMetricsResult.status === "rejected" ? [`audit_metrics: ${String(auditMetricsResult.reason)}`] : []),
+      ],
+      memory: {
+        rss_bytes: memory.rss,
+        heap_used_bytes: memory.heapUsed,
+        heap_total_bytes: memory.heapTotal,
+      },
+    });
+  });
+
+  router.get("/api/recovery/review", async (req, res) => {
+    // Require explicit workspace selection: a project recovery report must
+    // never silently show other ongoing projects or change durable records.
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const requested = req.query.workspace;
+      if (typeof requested !== "string" || !requested.trim() || requested.length > 4000) {
+        res.status(400).json({ ok: false, error: "Explicit workspace path required for recovery review" });
+        return;
+      }
+      const workspace = await validatePath(requested);
+      if (req.query.stale_hours !== undefined && typeof req.query.stale_hours !== "string") {
+        res.status(400).json({ ok: false, error: "stale_hours must be a single numeric value" });
+        return;
+      }
+      const hoursValue = req.query.stale_hours === undefined ? 24 : Number(req.query.stale_hours);
+      if (!Number.isFinite(hoursValue) || hoursValue < 1 || hoursValue > 720) {
+        res.status(400).json({ ok: false, error: "stale_hours must be between 1 and 720" });
+        return;
+      }
+      const [tasks, loops, transactions] = await Promise.all([
+        listAgentTasks(),
+        listCodingLoops(100),
+        listEditTransactions(500),
+      ]);
+      const review = buildWorkspaceRecoveryReview({
+        workspace, tasks, loops, transactions,
+        workers: getManagedProcessSnapshot(),
+        staleHours: hoursValue,
+      });
+      res.json({
+        ok: true,
+        ...review,
+        source_limits: {
+          coding_loops: 100,
+          edit_transactions: 500,
+          potentially_incomplete: loops.length >= 100 || transactions.length >= 500,
+        },
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/instructions/preview", (_req, res) => {
+    const text = options.instructionsPreview?.() ?? "";
+    const summary = options.instructionSummary?.() ?? {};
+    res.json({
+      ok: true,
+      summary,
+      preview: text.slice(0, 12000),
+      truncated: text.length > 12000,
+      total_chars: text.length,
+    });
+  });
+
+  router.get("/api/config/env", async (_req, res) => {
+    try {
+      const text = await fs.readFile(envPath, "utf-8");
+      res.json({ ok: true, path: envPath, ...publicDotEnvValues(parseDotEnv(text)) });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        res.json({ ok: true, path: envPath, values: {}, redacted_keys: [] });
+        return;
+      }
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  router.put("/api/config/env", async (req, res) => {
+    try {
+      const values = req.body?.values as Record<string, string>;
+      if (!values || typeof values !== "object") {
+        res.status(400).json({ ok: false, error: "values object required" });
+        return;
+      }
+      // Blank secret input means "unchanged", never overwrite an existing secret
+      // with a redaction placeholder. Explicit secret changes require the
+      // operator to configure ADMIN_TOKEN rather than unauthenticated localhost.
+      if (Object.entries(values).some(([key, value]) => isSensitiveEnvKey(key) && value !== "") &&
+          !process.env.ADMIN_TOKEN?.trim()) {
+        res.status(403).json({ ok: false, error: "Set ADMIN_TOKEN before changing secrets" });
+        return;
+      }
+      const mutation = envMutationQueue.catch(() => undefined).then(async () => {
+        let original = "";
+        try {
+          original = await fs.readFile(envPath, "utf-8");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const safeChanges = Object.fromEntries(
+          Object.entries(values).filter(([key, value]) => !(isSensitiveEnvKey(key) && value === ""))
+        );
+        const next = serializeDotEnv(safeChanges, original);
+        await atomicWriteText(envPath, next);
+        for (const [k, v] of Object.entries(safeChanges)) process.env[k] = v;
+      });
+      envMutationQueue = mutation;
+      await mutation;
+      res.json({ ok: true, path: envPath });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  router.get("/api/upstream", async (_req, res) => {
+    res.json({ ok: true, config: publicUpstreamConfig(manager.getConfig()), path: manager.getConfigPath() });
+  });
+
+  router.get("/api/skills", async (req, res) => {
+    try {
+      const root = await validatePath(typeof req.query.path === "string" && req.query.path.trim()
+        ? req.query.path : getDefaultCwd());
+      const scope: SkillControlScope = req.query.scope === "global" ? "global" : "project";
+      const [controls, skills] = await Promise.all([
+        getSkillControls(root, scope),
+        loadProjectSkills(root, true),
+      ]);
+      res.json({ ok: true, root, scope, controls, skills });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/skills", async (req, res) => {
+    try {
+      const root = await validatePath(typeof req.body?.path === "string" && req.body.path.trim()
+        ? req.body.path : getDefaultCwd());
+      const scope: SkillControlScope = req.body?.scope === "global" ? "global" : "project";
+      const controls = await saveSkillControls(root, scope, req.body?.controls);
+      res.json({ ok: true, root, scope, controls, skills: await loadProjectSkills(root, true) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch("/api/skills", async (req, res) => {
+    try {
+      const root = await validatePath(typeof req.body?.path === "string" && req.body.path.trim()
+        ? req.body.path : getDefaultCwd());
+      const scope: SkillControlScope = req.body?.scope === "global" ? "global" : "project";
+      const controls = await setSkillEnabled(root, scope, req.body?.name, req.body?.enabled);
+      res.json({ ok: true, root, scope, controls, skills: await loadProjectSkills(root, true) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/permissions", (_req, res) => {
+    res.json({
+      ok: true,
+      path: getPermissionConfigPath(),
+      config: getPermissionConfig(),
+      description: describePermissionProfile(),
+      restart_required: false,
+    });
+  });
+
+  router.put("/api/permissions", (req, res) => {
+    try {
+      const config = savePermissionConfig(req.body?.config ?? req.body ?? {});
+      res.json({
+        ok: true,
+        path: getPermissionConfigPath(),
+        config,
+        description: describePermissionProfile(),
+        restart_required: false,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/hooks", async (_req, res) => {
+    try {
+      res.json({ ok: true, path: getLocalHooksConfigPath(), config: await getLocalHooksConfig() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/hooks", async (req, res) => {
+    try {
+      const config = await saveLocalHooksConfig(req.body?.config ?? req.body ?? {});
+      res.json({ ok: true, path: getLocalHooksConfigPath(), config, restart_required: false });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/subagents", async (_req, res) => {
+    try {
+      const config = await getSubagentConfig();
+      res.json({
+        ok: true,
+        path: getSubagentConfigPath(),
+        config: { ...config, env: undefined },
+        env_keys: Object.keys(config.env ?? {}),
+        chatgpt_subscription_reuse: false,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/subagents", async (req, res) => {
+    try {
+      const submitted = req.body?.config ?? req.body ?? {};
+      const current = await getSubagentConfig();
+      const config = await saveSubagentConfig({
+        ...submitted,
+        env: submitted.env === undefined ? current.env : submitted.env,
+      });
+      res.json({
+        ok: true,
+        path: getSubagentConfigPath(),
+        config: { ...config, env: undefined },
+        env_keys: Object.keys(config.env ?? {}),
+        chatgpt_subscription_reuse: false,
+        restart_required: false,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  router.get("/api/codex-hooks", async (_req, res) => {
+    try {
+      res.json({ ok: true, hooks: await getCodexHooks() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/codex-hooks", async (req, res) => {
+    try {
+      res.json({ ok: true, hooks: await saveCodexHooks(req.body?.enabled) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/local-tools", async (_req, res) => {
+    try {
+      res.json({ ok: true, tools: LOCAL_TOOL_CATALOG, overrides: getLocalToolOverrides() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/local-tools", async (req, res) => {
+    try {
+      const raw = req.body?.overrides ?? {};
+      const next = {
+        enabled: Array.isArray(raw.enabled) ? raw.enabled.filter((name: unknown): name is string => typeof name === "string") : [],
+        disabled: Array.isArray(raw.disabled) ? raw.disabled.filter((name: unknown): name is string => typeof name === "string") : [],
+      };
+      saveLocalToolOverrides(next);
+      res.json({
+        ok: true,
+        overrides: getLocalToolOverrides(),
+        restart_required: "Open a new ChatGPT MCP session after changing local tool visibility.",
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/upstream", async (req, res) => {
+    try {
+      const submitted = (req.body?.config ?? defaultUpstreamConfig()) as UpstreamConfigFile;
+      const config = {
+        ...submitted,
+        servers: submitted.servers.map((server) =>
+          mergeUpstreamSecretPlaceholders(server, manager.getServerConfig(server.id))),
+      };
+      const saved = await manager.updateConfig(config);
+      res.json({ ok: true, config: publicUpstreamConfig(saved) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/upstream", async (req, res) => {
+    try {
+      const server = req.body?.server as UpstreamServerConfig;
+      if (!server?.id) {
+        res.status(400).json({ ok: false, error: "server.id required" });
+        return;
+      }
+      await manager.upsertServer(mergeUpstreamSecretPlaceholders(server, manager.getServerConfig(server.id)));
+      res.json({ ok: true, config: publicUpstreamConfig(manager.getConfig()) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/upstream/presets/computer-use", async (_req, res) => {
+    try {
+      const added = await manager.addMissingServers(computerUseMcpPresets());
+      res.json({
+        ok: true,
+        added,
+        config: publicUpstreamConfig(manager.getConfig()),
+        note: "Presets are disabled by default. Install the CLIs separately, then review and enable them.",
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.delete("/api/upstream/:id", async (req, res) => {
+    const removed = await manager.removeServer(req.params.id);
+    if (!removed) {
+      res.status(404).json({ ok: false, error: "not found" });
+      return;
+    }
+    res.json({ ok: true, config: publicUpstreamConfig(manager.getConfig()) });
+  });
+
+  router.post("/api/upstream/:id/test", async (req, res) => {
+    try {
+      const status = await manager.checkHealth(req.params.id);
+      res.json({ ok: status.health === "connected", status });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/upstream/:id/oauth/status", async (req, res) => {
+    try {
+      res.json({ ok: true, status: await manager.oauthStatus(req.params.id) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/upstream/:id/oauth/start", async (req, res) => {
+    try {
+      const status = await manager.startOAuth(req.params.id, req.body?.reset !== false);
+      res.json({ ok: true, status });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/upstream/:id/oauth/disconnect", async (req, res) => {
+    try {
+      await manager.disconnectOAuth(req.params.id);
+      res.json({ ok: true, status: await manager.oauthStatus(req.params.id) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/upstream/:id/tools", async (req, res) => {
+    try {
+      const tools = await manager.listTools(req.params.id);
+      const config = manager.getServerConfig(req.params.id);
+      res.json({
+        ok: true,
+        tools: tools.map((t) => ({ name: t.name, description: t.description })),
+        proxied_tools: config ? manager.getProxiedToolNames(config, tools) : [],
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/import/sources", async (_req, res) => {
+    try {
+      const sources = await discoverMcpConfigs();
+      res.json({ ok: true, sources });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  async function handleImport(
+    source: McpImportSource,
+    body: { path?: string; merge?: boolean; enable?: boolean }
+  ) {
+    const configPath = body.path || (await findMcpConfigForSource(source));
+    if (!configPath) throw new Error(`${source} MCP config not found on this machine`);
+    return importMcpConfigFromFile(configPath, source, {
+      merge: body.merge !== false,
+      enableImported: Boolean(body.enable),
+    });
+  }
+
+  router.post("/api/import/:source", async (req, res) => {
+    try {
+      const source = req.params.source as McpImportSource;
+      if (!["cursor", "claude", "opencode", "file"].includes(source)) {
+        res.status(400).json({ ok: false, error: "Unknown import source" });
+        return;
+      }
+      const filePath = req.body?.path as string | undefined;
+      if (source === "file" && !filePath) {
+        res.status(400).json({ ok: false, error: "path required for file import" });
+        return;
+      }
+      const detectSource: McpImportSource =
+        source === "file" ? (req.body?.detect_as as McpImportSource) || "cursor" : source;
+      const result = await importMcpConfigFromFile(filePath || (await findMcpConfigForSource(source))!, detectSource, {
+        merge: req.body?.merge !== false,
+        enableImported: Boolean(req.body?.enable),
+      });
+      await manager.reloadConfig();
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/import/cursor", async (req, res) => {
+    try {
+      const result = await handleImport("cursor", req.body ?? {});
+      await manager.reloadConfig();
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  function filterActivity(
+    entries: ActivityEntry[],
+    opts: { kind?: string; status?: string; tool?: string; q?: string }
+  ): ActivityEntry[] {
+    let out = entries;
+    if (opts.kind && opts.kind !== "all") {
+      out = out.filter((e) => e.kind === opts.kind);
+    }
+    if (opts.status === "error") {
+      out = out.filter((e) => e.status === "error" || e.status === "blocked");
+    }
+    if (opts.tool) {
+      const needle = opts.tool.toLowerCase();
+      out = out.filter((e) => e.tool?.toLowerCase().includes(needle));
+    }
+    if (opts.q) {
+      const needle = opts.q.toLowerCase();
+      out = out.filter((e) => {
+        const hay = [e.tool, e.action, e.target, e.summary, e.client, e.session_id]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return hay.includes(needle);
+      });
+    }
+    return out;
+  }
+
+  router.get("/api/activity", (req, res) => {
+    const limit = Math.min(parseInt(String(req.query.limit || "100"), 10) || 100, 500);
+    const since = typeof req.query.since === "string" ? req.query.since : undefined;
+    const entries = filterActivity(getRecentActivity(limit, since), {
+      kind: typeof req.query.kind === "string" ? req.query.kind : undefined,
+      status: typeof req.query.status === "string" ? req.query.status : undefined,
+      tool: typeof req.query.tool === "string" ? req.query.tool : undefined,
+      q: typeof req.query.q === "string" ? req.query.q : undefined,
+    });
+    res.json({ ok: true, entries, count: entries.length });
+  });
+
+  router.get("/api/activity/history", async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(String(req.query.limit || "80"), 10) || 80, 500);
+      const entries = await loadAuditHistory(limit);
+      res.json({ ok: true, entries, source: "audit_file" });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/workers", async (_req, res) => {
+    try {
+      res.json({ ok: true, workers: (await listWorkers()).map(publicAdminWorker) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/workers/:id", async (req, res) => {
+    try {
+      const worker = await getWorker(req.params.id);
+      if (!worker) { res.status(404).json({ ok: false, error: "worker not found" }); return; }
+      res.json({ ok: true, worker: publicAdminWorker(worker) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/workers/:id/cancel", async (req, res) => {
+    try {
+      const worker = await getWorker(req.params.id);
+      if (!worker) { res.status(404).json({ ok: false, error: "worker not found" }); return; }
+      if (worker.kind === "subagent" && worker.source === "omp-subagent") {
+        try {
+          await stopSubagent(worker.id);
+        } catch {
+          // subagent already gone (e.g. server restarted) -> registry is authoritative
+        }
+      }
+      const after =
+        (await getWorker(worker.id)) ??
+        (await updateWorkerStatus(worker.id, "cancelled", { reason: "Cancelled via Admin UI." }));
+      res.json({ ok: true, worker: after ? publicAdminWorker(after) : null });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/activity/stream", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+
+    const send = (entry: ActivityEntry) => {
+      res.write(`data: ${JSON.stringify(entry)}\n\n`);
+    };
+
+    for (const entry of getRecentActivity(30).reverse()) send(entry);
+
+    const unsub = subscribeActivity(send);
+    const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+
+    req.on("close", () => {
+      unsub();
+      clearInterval(ping);
+    });
+  });
+
+  return router;
+}

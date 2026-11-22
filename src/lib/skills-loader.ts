@@ -1,0 +1,280 @@
+import fs from "fs/promises";
+import os from "os";
+import path from "path";
+import { validatePath } from "./path-security.js";
+import { requireWriteAllowed } from "./permissions.js";
+import { atomicWriteText } from "./atomic-file.js";
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  path: string;
+  source?: "project" | "global";
+  enabled?: boolean;
+}
+
+export type SkillControlScope = "project" | "global";
+export interface SkillControls {
+  version: 1;
+  disabled: string[];
+}
+
+function controlsPath(workspaceRoot: string, scope: SkillControlScope): string {
+  return scope === "project"
+    ? path.join(workspaceRoot, ".local-coder", "skills.json")
+    : path.resolve(process.env.LOCAL_CODER_GLOBAL_SKILLS_CONFIG?.trim() ||
+        path.join(os.homedir(), ".local-coder", "skills.json"));
+}
+
+function normalizeSkillControls(raw: unknown): SkillControls {
+  if (!raw || typeof raw !== "object" ||
+    (raw as Record<string, unknown>).version !== 1 ||
+    !Array.isArray((raw as Record<string, unknown>).disabled)) {
+    throw new Error("Invalid skill controls: expected version=1 and a disabled array");
+  }
+  const names = (raw as { disabled: unknown[] }).disabled;
+  if (names.length > 512 || names.some((value) =>
+    typeof value !== "string" || value.length > 200 || !value.trim())) {
+    throw new Error("Invalid skill controls: disabled must contain up to 512 nonempty names");
+  }
+  return { version: 1, disabled: [...new Set((names as string[]).map((name) => name.trim()))] };
+}
+
+export async function getSkillControls(workspaceRoot: string, scope: SkillControlScope): Promise<SkillControls> {
+  try {
+    return normalizeSkillControls(JSON.parse(await fs.readFile(controlsPath(workspaceRoot, scope), "utf-8")));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, disabled: [] };
+    throw error;
+  }
+}
+
+export async function saveSkillControls(
+  workspaceRoot: string, scope: SkillControlScope, raw: SkillControls
+): Promise<SkillControls> {
+  const controls = normalizeSkillControls(raw);
+  const target = await validatePath(controlsPath(workspaceRoot, scope));
+  requireWriteAllowed(target);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await atomicWriteText(target, JSON.stringify(controls, null, 2) + "\n");
+  return controls;
+}
+
+const pendingSkillUpdates = new Map<string, Promise<SkillControls>>();
+
+/**
+ * Update one toggle without overwriting unrelated toggles. Concurrent changes
+ * within a Local ChatGPT Plus process are serialized per controls file.
+ */
+export async function setSkillEnabled(
+  workspaceRoot: string, scope: SkillControlScope, name: string, enabled: boolean
+): Promise<SkillControls> {
+  if (typeof name !== "string" || !name.trim() || name.length > 200 || typeof enabled !== "boolean") {
+    throw new Error("Skill toggle requires a valid name and boolean enabled");
+  }
+  const key = controlsPath(workspaceRoot, scope);
+  const previous = pendingSkillUpdates.get(key);
+  const next = (previous?.catch(() => ({ version: 1 as const, disabled: [] })) ?? Promise.resolve())
+    .then(async () => {
+      const controls = await getSkillControls(workspaceRoot, scope);
+      const disabled = new Set(controls.disabled);
+      if (enabled) disabled.delete(name.trim());
+      else disabled.add(name.trim());
+      return saveSkillControls(workspaceRoot, scope, { version: 1, disabled: [...disabled] });
+    });
+  pendingSkillUpdates.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (pendingSkillUpdates.get(key) === next) pendingSkillUpdates.delete(key);
+  }
+}
+
+function yamlScalar(value: string): string {
+  const text = value.trim();
+  if (text.startsWith('"') && text.endsWith('"')) {
+    try { return JSON.parse(text) as string; }
+    catch { return text.slice(1, -1); }
+  }
+  if (text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replace(/''/g, "'");
+  }
+  return text.replace(/\s+#.*$/, "").trim();
+}
+
+function parseFrontmatter(content: string): { name?: string; description?: string } {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) return {};
+  const result: { name?: string; description?: string } = {};
+  const lines = match[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const entry = lines[i].match(/^(name|description):[ \t]*(.*)$/);
+    if (!entry) continue;
+    let value = entry[2].trim();
+    if (/^[>|][+-]?$/.test(value)) {
+      const style = value[0];
+      const chunks: string[] = [];
+      while (i + 1 < lines.length && (!lines[i + 1].trim() || /^[ \t]+/.test(lines[i + 1]))) {
+        chunks.push(lines[++i].trim());
+      }
+      value = style === "|" ? chunks.join("\n").trim() : chunks.join(" ").replace(/\s+/g, " ").trim();
+    } else {
+      value = yamlScalar(value);
+    }
+    if (entry[1] === "name") result.name = value;
+    else result.description = value;
+  }
+  return result;
+}
+
+/** Read at most limit + 1 bytes. Discovery must not load untrusted giant SKILL.md files. */
+async function readFilePrefix(filePath: string, limit: number): Promise<{ content: string; truncated: boolean }> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 2_000_000) {
+    throw new Error("Skill read limit must be between 1 and 2000000 bytes");
+  }
+  const file = await fs.open(filePath, "r");
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new Error("Skill must be a regular file");
+    const buffer = Buffer.alloc(Math.min(limit + 1, stat.size));
+    let used = 0;
+    while (used < buffer.length) {
+      const { bytesRead } = await file.read(buffer, used, buffer.length - used, used);
+      if (!bytesRead) break;
+      used += bytesRead;
+    }
+    return {
+      content: buffer.subarray(0, Math.min(limit, used)).toString("utf-8"),
+      truncated: stat.size > limit || used > limit,
+    };
+  } finally {
+    await file.close();
+  }
+}
+
+export async function loadProjectSkills(workspaceRoot: string, includeDisabled = false): Promise<SkillSummary[]> {
+  const out: SkillSummary[] = [];
+  const seenNames = new Set<string>();
+  const [globalControls, projectControls] = await Promise.all([
+    getSkillControls(workspaceRoot, "global"),
+    getSkillControls(workspaceRoot, "project"),
+  ]);
+  const disabled = new Set([...globalControls.disabled, ...projectControls.disabled]);
+  const locations: Array<{ dir: string; source: "project" | "global" }> = [
+    ...[".agents", ".claude", ".codex"].map((folder) => ({ dir: path.join(workspaceRoot, folder, "skills"), source: "project" as const })),
+    ...[".agents", ".claude", ".codex"].map((folder) => ({ dir: path.join(os.homedir(), folder, "skills"), source: "global" as const })),
+    ...(process.env.LOCAL_CODER_SKILL_DIRS || "").split(path.delimiter).filter(Boolean)
+      .map((dir) => ({ dir: path.resolve(dir), source: "global" as const })),
+  ];
+  const visited = new Set<string>();
+
+  async function walk(dir: string, depth: number, source: "project" | "global"): Promise<void> {
+    if (depth > 3) return;
+    const canonical = await fs.realpath(dir).catch(() => undefined);
+    if (!canonical || visited.has(canonical)) return;
+    visited.add(canonical);
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const skillFile = path.join(full, "SKILL.md");
+        try {
+          await validatePath(skillFile);
+          const { content } = await readFilePrefix(skillFile, 16_384);
+          const fm = parseFrontmatter(content);
+          const name = fm.name || entry.name;
+          const description = fm.description || content.split("\n").find((l) => l.trim() && !l.startsWith("#"))?.trim() || name;
+          if (!seenNames.has(name)) {
+            seenNames.add(name);
+            if (includeDisabled || !disabled.has(name)) {
+              out.push({ name, description: description.slice(0, 200), path: skillFile, source, enabled: !disabled.has(name) });
+            }
+          }
+        } catch {
+          await walk(full, depth + 1, source);
+        }
+      }
+    }
+  }
+
+  for (const location of locations) await walk(location.dir, 0, location.source);
+  return out;
+}
+
+export function formatSkillsForInstructions(skills: SkillSummary[]): string {
+  if (!skills.length) return "";
+  return [
+    "## Skills",
+    `${skills.length} skills are available. Call list_skills, then load_skill(name) before applying a matching workflow; do not guess a skill body from its name.`,
+  ].join("\n");
+}
+
+function assertInsideDirectory(root: string, candidate: string): void {
+  const relative = path.relative(root, candidate);
+  if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+    throw new Error("Skill reference must be inside its skill directory");
+  }
+}
+
+async function readSkillReference(skillFile: string, referencePath: string, maxBytes: number) {
+  if (!referencePath.trim() || path.isAbsolute(referencePath) || referencePath.includes("\0")) {
+    throw new Error("Skill reference must be a relative text file");
+  }
+  const root = await fs.realpath(path.dirname(skillFile));
+  const candidate = path.resolve(root, referencePath);
+  assertInsideDirectory(root, candidate);
+  if (!/\.(?:md|txt)$/i.test(candidate)) {
+    throw new Error("Skill reference must be a .md or .txt file");
+  }
+  const realCandidate = await fs.realpath(candidate);
+  assertInsideDirectory(root, realCandidate);
+  await validatePath(realCandidate);
+  const stat = await fs.stat(realCandidate);
+  if (!stat.isFile()) throw new Error("Skill reference must be a regular file");
+  const file = await fs.open(realCandidate, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    return {
+      path: realCandidate,
+      content: buffer.subarray(0, Math.min(bytesRead, maxBytes)).toString("utf-8"),
+      truncated: stat.size > maxBytes || bytesRead > maxBytes,
+    };
+  } finally {
+    await file.close();
+  }
+}
+
+export async function loadProjectSkill(
+  workspaceRoot: string,
+  name: string,
+  maxBytes = 200_000,
+  referencePath?: string
+): Promise<{
+  skill: SkillSummary;
+  content: string;
+  truncated: boolean;
+  reference_only?: boolean;
+  references?: Array<{ path: string; content: string; truncated: boolean }>;
+}> {
+  const skill = (await loadProjectSkills(workspaceRoot)).find((candidate) => candidate.name === name);
+  if (!skill) throw new Error(`Unknown project skill: ${name}`);
+  await validatePath(skill.path);
+  if (referencePath !== undefined) {
+    const reference = await readSkillReference(skill.path, referencePath, maxBytes);
+    return {
+      skill,
+      content: "",
+      truncated: reference.truncated,
+      reference_only: true,
+      references: [reference],
+    };
+  }
+  const data = await readFilePrefix(skill.path, maxBytes);
+  return { skill, content: data.content, truncated: data.truncated };
+}

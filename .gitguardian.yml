@@ -1,0 +1,4 @@
+# No broad secret allowlists are configured; synthetic test examples
+# are assembled at test time rather than stored as token-shaped literals.
+version: 2
+matches: []

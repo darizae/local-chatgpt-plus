@@ -1,0 +1,118 @@
+import fs from "fs/promises";
+import path from "path";
+import { randomUUID } from "node:crypto";
+import { appendActivity } from "./activity-log.js";
+import { boundDiagnosticValue } from "./bounded-value.js";
+import { getRuntimeIdentity } from "./runtime-identity.js";
+import { redactSecretsInText, sanitizeDetails } from "./sanitize-activity.js";
+
+export type AuditStatus = "ok" | "error" | "blocked" | "dry-run";
+
+export interface AuditEvent {
+  tool: string;
+  action: string;
+  target?: string;
+  status?: AuditStatus;
+  details?: Record<string, unknown>;
+}
+
+const auditPath = process.env.AUDIT_LOG_PATH || path.resolve(process.cwd(), ".mcp-audit.log");
+const AUDIT_LOG_MAX_BYTES = (() => {
+  const parsed = Number(process.env.AUDIT_LOG_MAX_BYTES || 10 * 1024 * 1024);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 10 * 1024 * 1024;
+  return Math.min(Math.max(Math.trunc(parsed), 1024 * 1024), 100 * 1024 * 1024);
+})();
+let auditWriteQueue = Promise.resolve();
+
+/**
+ * Start a fresh active audit log without destroying its history. The old log is
+ * moved to a uniquely named archive in the durable state folder under a write
+ * queue barrier, so concurrent audit events remain correctly ordered.
+ */
+export async function archiveCurrentAuditLog(): Promise<string | null> {
+  const operation = auditWriteQueue.catch(() => undefined).then(async () => {
+    try {
+      await fs.stat(auditPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    // Keep archives alongside the configured audit destination. This also
+    // prevents isolated test logs from polluting the production state tree.
+    const dir = path.join(path.dirname(auditPath), ".mcp-state", "audit-archive");
+    await fs.mkdir(dir, { recursive: true });
+    const archive = path.join(dir, `audit-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}.log`);
+    await fs.rename(auditPath, archive);
+    return archive;
+  });
+  auditWriteQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+async function appendAuditLine(line: string): Promise<void> {
+  const bytes = Buffer.byteLength(line, "utf8");
+  try {
+    const stat = await fs.stat(auditPath);
+    if (stat.size + bytes > AUDIT_LOG_MAX_BYTES) {
+      const rotated = `${auditPath}.1`;
+      await fs.rm(rotated, { force: true }).catch(() => undefined);
+      await fs.rename(auditPath, rotated);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await fs.mkdir(path.dirname(auditPath), { recursive: true });
+  await fs.appendFile(auditPath, line, "utf-8");
+}
+
+export async function audit(event: AuditEvent): Promise<void> {
+  const safe: AuditEvent = {
+    ...event,
+    target: event.target !== undefined ? redactSecretsInText(event.target) : undefined,
+    details: sanitizeDetails(event.details),
+  };
+  const record = boundDiagnosticValue({
+    time: new Date().toISOString(),
+    pid: process.pid,
+    run_id: getRuntimeIdentity().run_id,
+    ...safe,
+  }, {
+    maxStringChars: 4_000,
+    maxArrayItems: 80,
+    maxObjectKeys: 120,
+    maxDepth: 6,
+  });
+
+  try {
+    const line = JSON.stringify(record) + "\n";
+    const write = auditWriteQueue.then(() => appendAuditLine(line));
+    auditWriteQueue = write.catch(() => undefined);
+    await write;
+  } catch {
+    // Audit must never break the requested tool call.
+  }
+
+  // Canonical __runtime records are analytics-only. Do not mirror them into
+  // the live activity feed or console, otherwise every tool call appears twice.
+  if (safe.action === "__runtime") return;
+
+  try {
+    appendActivity({
+      kind: "tool",
+      tool: safe.tool,
+      action: safe.action,
+      target: safe.target,
+      status: safe.status ?? "ok",
+      summary: safe.target || (safe.details ? JSON.stringify(safe.details).slice(0, 120) : undefined),
+      details: safe.details,
+    });
+  } catch {}
+}
+
+export function getAuditPath(): string {
+  return auditPath;
+}
+
+export function getAuditLogMaxBytes(): number {
+  return AUDIT_LOG_MAX_BYTES;
+}

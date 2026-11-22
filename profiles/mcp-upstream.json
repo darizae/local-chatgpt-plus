@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "id": "vercel-agent-desktop",
+      "name": "Vercel agent-desktop (native UI)",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "agent-desktop",
+      "args": [
+        "mcp"
+      ],
+      "env": {},
+      "auth": {
+        "type": "none"
+      },
+      "tool_prefix": "desktop",
+      "expose": "meta_only",
+      "tools": [],
+      "disabled_tools": [],
+      "idle_timeout_sec": 600
+    },
+    {
+      "id": "vercel-agent-browser",
+      "name": "Vercel agent-browser (Chrome)",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "agent-browser",
+      "args": [
+        "mcp",
+        "--tools",
+        "all"
+      ],
+      "env": {
+        "AGENT_BROWSER_NAMESPACE": "local-chatgpt-plus",
+        "AGENT_BROWSER_SESSION": "local-chatgpt-plus"
+      },
+      "auth": {
+        "type": "none"
+      },
+      "tool_prefix": "browser",
+      "expose": "meta_only",
+      "tools": [],
+      "disabled_tools": [],
+      "idle_timeout_sec": 600
+    }
+  ]
+}

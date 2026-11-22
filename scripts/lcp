@@ -1,0 +1,994 @@
+#!/usr/bin/env bash
+# lcp — Local ChatGPT Plus + Secure MCP Tunnel lifecycle controller.
+#
+# User-level launchd-managed ON/OFF control for:
+#   * the Local ChatGPT Plus MCP server (node dist/index.js)
+#   * the OpenAI Secure MCP Tunnel (tunnel-client run)
+#
+# Services are managed by per-user launchd jobs bootstrapped on demand from a
+# state directory OUTSIDE the auto-loaded LaunchAgents folders, so nothing
+# starts at login. While a job is loaded, launchd supervises (KeepAlive) and
+# restarts it after an unexpected crash. `lcp off` fully unloads both jobs.
+#
+# Install:  scripts/lcp-install.sh   (copies this file to ~/.local/bin/lcp)
+#
+# NOTE FOR AGENTS: the user runs the INSTALLED copy at ~/.local/bin/lcp, not
+# this file. After editing this file you MUST reinstall so the change is live:
+#   scripts/lcp-install.sh   (or: lcp _install)
+# Otherwise edits here are a silent no-op on the running binary.
+# Usage:    lcp on|off|status|restart|toggle|mode|migrate
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+STATE_DIR="${LCP_STATE_DIR:-$HOME/.local/lcp}"
+CONFIG_FILE="$STATE_DIR/state/config"
+LAUNCHD_DIR="$STATE_DIR/launchd"
+PROFILES_DIR="$STATE_DIR/profiles"
+LOGS_DIR="$STATE_DIR/logs"
+LOCK_FILE="$STATE_DIR/state/lock"
+MODE_FILE="$STATE_DIR/state/mode"
+
+SERVER_LABEL="com.localchatgpt.plus.server"
+TUNNEL_LABEL="com.localchatgpt.plus.tunnel"
+SERVER_PORT=3000
+ADMIN_PORT=3001
+TUNNEL_HEALTH_PORT=8090
+
+# Values overridable through the per-user config file (written by the installer).
+# - LCP_REPO        absolute path to the Local ChatGPT Plus checkout
+# - LCP_TUNNEL_YAML absolute path to the tunnel profile
+# - LCP_TUNNEL_BIN  absolute path to the tunnel-client executable
+# - LCP_NODE_BIN    absolute path to the node executable
+# - LCP_USER        macOS account name that owns the services (defaults to $USER)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- default discovery ----------------------------------------------------
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+if [ -z "${LCP_REPO:-}" ]; then
+  if [ -f "$SCRIPT_DIR/../package.json" ] && [ "$(basename "$SCRIPT_DIR")" = "scripts" ]; then
+    LCP_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+  else
+    echo "LCP_REPO is not configured. Run scripts/lcp-install.sh from the checkout." >&2
+    exit 1
+  fi
+fi
+LCP_TUNNEL_YAML="${LCP_TUNNEL_YAML:-$HOME/lcp-tunnel.yaml}"
+LCP_TUNNEL_BIN="${LCP_TUNNEL_BIN:-/opt/homebrew/bin/tunnel-client}"
+LCP_NODE_BIN="${LCP_NODE_BIN:-$(command -v node || echo /usr/local/bin/node)}"
+LCP_USER="${LCP_USER:-$USER}"
+
+# Access-mode roots (used to generate per-mode permission profiles).
+# Projects mode = custom multi-root profile; unsafe runtimes stay disabled.
+LCP_WORKSPACE_ROOT="${LCP_WORKSPACE_ROOT:-$HOME/lcp-disposable}"
+LCP_PROJECT_ROOTS=(
+  "${LCP_PROJECT_ROOT_1:-$HOME/repos}"
+  "${LCP_PROJECT_ROOT_2:-$HOME/Downloads}"
+  "${LCP_PROJECT_ROOT_3:-$HOME/lcp-disposable}"
+)
+
+# launchd gui domain targets the console user's GUI session; services started
+# there survive OMP/Terminal exiting.
+GUID="gui/$UID"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+# Locking + single EXIT cleanup. LOCK_DIR is removed on every exit; jobs
+# started by `on` that did not finish are unloaded if their cleanup flag is set.
+LOCK_DIR=""
+CLEANUP_SERVER=no
+CLEANUP_TUNNEL=no
+
+release_lock() {
+  [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ] && rmdir "$LOCK_DIR" 2>/dev/null || true
+  LOCK_DIR=""
+}
+
+lcp_exit_cleanup() {
+  if [ "$CLEANUP_SERVER" = "yes" ]; then unload_job "$SERVER_LABEL" 2>/dev/null || true; fi
+  if [ "$CLEANUP_TUNNEL" = "yes" ]; then unload_job "$TUNNEL_LABEL" 2>/dev/null || true; fi
+  release_lock
+}
+trap 'lcp_exit_cleanup' EXIT
+
+die() { echo "lcp: error: $*" >&2; exit 1; }
+warn() { echo "lcp: warning: $*" >&2; }
+info() { echo "lcp: $*"; }
+
+# Privacy reminder for the node Accessibility grant that macOS desktop access
+# (agent-desktop spawned by the server) relies on. tccutil cannot revoke a bare,
+# unbundled binary, so off/on cannot automate the TCC toggle; this surfaces the
+# manual one-click step. open=1 best-effort opens the System Settings pane.
+computer_use_accessibility_note() {
+  local open="${1:-0}" label client
+  label="macOS Accessibility"; client="node"
+  if [ "$open" = "1" ]; then
+    {
+      printf '%s\n' "lcp: opening System Settings -> Privacy & Security -> Accessibility so you can toggle $client off."
+      command -v open >/dev/null 2>&1 \
+        && open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null \
+        || true
+    }
+  else
+    printf '%s\n' "lcp: remember: if you disabled the $label grant for $client, re-enable it (System Settings -> Privacy & Security -> Accessibility) before desktop automation is used again."
+  fi
+}
+
+require_tools() {
+  for t in curl jq lsof launchctl; do
+    command -v "$t" >/dev/null 2>&1 || die "missing required tool: $t"
+  done
+  [ -x "$LCP_NODE_BIN" ] || die "node not found at $LCP_NODE_BIN (set LCP_NODE_BIN)"
+  [ -x "$LCP_TUNNEL_BIN" ] || die "tunnel-client not found at $LCP_TUNNEL_BIN (set LCP_TUNNEL_BIN)"
+  [ -f "$LCP_TUNNEL_YAML" ] || die "tunnel profile not found at $LCP_TUNNEL_YAML"
+  [ -d "$LCP_REPO" ] || die "repo not found at $LCP_REPO"
+  [ -f "$LCP_REPO/dist/index.js" ] || die "build missing: $LCP_REPO/dist/index.js (run: cd $LCP_REPO && npm run build)"
+}
+
+ensure_state_dirs() {
+  mkdir -p "$STATE_DIR/state" "$LAUNCHD_DIR" "$PROFILES_DIR" "$LOGS_DIR"
+  chmod 700 "$STATE_DIR" "$STATE_DIR/state" "$LAUNCHD_DIR" "$PROFILES_DIR" "$LOGS_DIR"
+}
+
+acquire_lock() {
+  ensure_state_dirs
+  # Reentrant: off->on / mode / restart acquire the lock more than once in one
+  # process; if we already hold it, keep holding until process exit.
+  if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+    return 0
+  fi
+  LOCK_DIR="$STATE_DIR/state/lock.d"
+  local tries=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    # Stale-lock recovery: a lock older than 5 minutes is almost certainly a
+    # leftover from a killed controller; reclaim it.
+    if [ -d "$LOCK_DIR" ] && [ "$(find "$LOCK_DIR" -maxdepth 0 -mmin +5 2>/dev/null | wc -l | tr -d ' ')" -ge 1 ]; then
+      rmdir "$LOCK_DIR" 2>/dev/null && continue
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -ge 120 ] && die "timed out acquiring lock ($LOCK_DIR); another lcp command may be running"
+    sleep 0.5
+  done
+}
+
+# listener_pid <port> -> PID of the process listening on a TCP port, or empty
+listener_pid() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
+}
+
+# job_pid <label> -> PID of the launchd job's main process, or empty
+job_pid() {
+  launchctl print "$GUID/$1" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' \
+    | head -1 || true
+}
+
+# job_loaded <label>
+job_loaded() {
+  launchctl print "$GUID/$1" >/dev/null 2>&1
+}
+
+# health_ok <port> -> 0 when the endpoint responds
+health_ok() {
+  curl -fsS -m 3 "http://127.0.0.1:$1/health" >/dev/null 2>&1
+}
+
+ready_ok() {
+  local body
+  body="$(curl -fsS -m 3 "http://127.0.0.1:$1/readyz" 2>/dev/null || true)"
+  [ -n "$body" ] && printf '%s' "$body" | grep -qiE 'ready|ok'
+}
+
+wait_for() {
+  # wait_for <seconds> <fn> [args...]
+  local secs="$1" fn="$2"; shift 2
+  local waited=0
+  while [ "$waited" -lt "$secs" ]; do
+    if "$fn" "$@"; then return 0; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# admin_ready -> 0 once the Admin UI (port 3001) has a listening socket.
+admin_ready() {
+  [ -n "$(listener_pid "$ADMIN_PORT")" ]
+}
+
+# Open the Admin dashboard in the default browser, exactly once, after the
+# Admin UI is ready. Only from an interactive terminal (never a headless or
+# launchd/daemon context, which would steal focus); LCP_OPEN_DASHBOARD=0
+# forces it off and =1 forces it on (test hook). Only direct `lcp on` sets
+# LCP_ALLOW_OPEN, so restart/mode/toggle never auto-open.
+open_dashboard() {
+  [ "${LCP_ALLOW_OPEN:-0}" = "1" ] || return 0
+  [ "${LCP_OPEN_DASHBOARD:-auto}" != "0" ] || return 0
+  if [ "${LCP_OPEN_DASHBOARD:-auto}" != "1" ] && [ ! -t 0 ]; then return 0; fi
+  command -v open >/dev/null 2>&1 || return 0
+  if ! wait_for 20 admin_ready; then
+    warn "Admin dashboard not ready on port $ADMIN_PORT; skipping auto-open"
+    return 0
+  fi
+  open "http://127.0.0.1:$ADMIN_PORT/ui" >/dev/null 2>&1 || true
+  info "Opened Admin dashboard: http://127.0.0.1:$ADMIN_PORT/ui"
+}
+
+# ---------------------------------------------------------------------------
+# Mode configuration
+# ---------------------------------------------------------------------------
+# Each mode writes its own generated, ignored permission-profile JSON under the
+# state dir and points PERMISSIONS_CONFIG at it. Ordinary `lcp on` always
+# selects workspace regardless of any previously stored mode.
+write_mode_permissions() {
+  local mode="$1" file
+  file="$PROFILES_DIR/permissions.$mode.json"
+  case "$mode" in
+    workspace)
+      cat > "$file" <<JSON
+{
+  "version": 1,
+  "profile": "workspace",
+  "path_roots": ["$LCP_WORKSPACE_ROOT"]
+}
+JSON
+      ;;
+    projects)
+      {
+        echo '{'
+        echo '  "version": 1,'
+        echo '  "profile": "custom",'
+        echo '  "path_roots": ['
+        local first=1
+        for r in "${LCP_PROJECT_ROOTS[@]}"; do
+          if [ "$first" -eq 1 ]; then first=0; else echo ','; fi
+          printf '    "%s"' "$r"
+        done
+        echo ''
+        echo '  ],'
+        echo '  "allow_write": true,'
+        echo '  "allow_commands": true,'
+        echo '  "allow_unsafe_runtimes": false'
+        echo '}'
+      } > "$file"
+      ;;
+    full)
+      cat > "$file" <<'JSON'
+{
+  "version": 1,
+  "profile": "open"
+}
+JSON
+      ;;
+    *) die "unknown mode: $mode" ;;
+  esac
+  chmod 600 "$file"
+  echo "$file"
+}
+
+# mode_permissions_file <mode> -> path (idempotent write)
+mode_permissions_file() {
+  write_mode_permissions "$1"
+}
+
+store_mode() {
+  printf '%s\n' "$1" > "$MODE_FILE"
+  chmod 600 "$MODE_FILE"
+}
+
+clear_mode() {
+  rm -f "$MODE_FILE"
+}
+
+read_mode() {
+  if [ -f "$MODE_FILE" ]; then cat "$MODE_FILE"; fi
+}
+
+# normalize_mode <user-arg|-> -> validated mode (default workspace)
+normalize_mode() {
+  case "${1:---}" in
+    workspace|projects|full) printf '%s' "$1" ;;
+    -|""|--workspace) printf 'workspace' ;;
+    --projects) printf 'projects' ;;
+    --full|full) printf 'full' ;;
+    *) die "unknown mode '$1' (expected workspace|projects|full)" ;;
+  esac
+}
+
+confirm_full() {
+  if [ "${LCP_FULL_CONFIRM:-0}" = "1" ]; then return 0; fi
+  if [ "${LCP_YES:-0}" = "1" ]; then return 0; fi
+  if [ ! -t 0 ]; then
+    echo "lcp: FULL/YOLO mode (profile=open) gives unrestricted application-level" >&2
+    echo "     access across the machine, subject only to macOS user permissions." >&2
+    echo "     It requires explicit confirmation from an interactive terminal." >&2
+    echo "     Run: lcp on --mode full   and type YES when prompted." >&2
+    echo "     (Scripted/automation: LCP_FULL_CONFIRM=1 lcp on --mode full)" >&2
+    return 1
+  fi
+  echo "lcp: ============================================================" >&2
+  echo "lcp:  FULL MACHINE / YOLO mode will use the 'open' permission" >&2
+  echo "lcp:  profile: unrestricted paths, commands and unsafe runtimes." >&2
+  echo "lcp:  This is NOT an OS sandbox and is NOT an auth bypass." >&2
+  echo "lcp: ============================================================" >&2
+  local ans=""
+  read -r -p "Type YES to enable Full/YOLO mode: " ans
+  [ "$ans" = "YES" ] || { echo "lcp: confirmation declined." >&2; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# Launchd plist generation
+# ---------------------------------------------------------------------------
+write_server_plist() {
+  local perms_file="$1"
+  cat > "$LAUNCHD_DIR/$SERVER_LABEL.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SERVER_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$LCP_NODE_BIN</string>
+    <string>$LCP_REPO/dist/index.js</string>
+  </array>
+  <key>WorkingDirectory</key><string>$LCP_REPO</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>USER</key><string>$LCP_USER</string>
+    <key>PATH</key><string>$(dirname "$LCP_NODE_BIN"):/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PERMISSIONS_CONFIG</key><string>$perms_file</string>
+    <key>LOCAL_CODER_TUI</key><string>off</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>Umask</key><integer>27</integer>
+  <key>StandardOutPath</key><string>$LOGS_DIR/server.out.log</string>
+  <key>StandardErrorPath</key><string>$LOGS_DIR/server.err.log</string>
+</dict>
+</plist>
+PLIST
+  chmod 600 "$LAUNCHD_DIR/$SERVER_LABEL.plist"
+}
+
+write_tunnel_plist() {
+  cat > "$LAUNCHD_DIR/$TUNNEL_LABEL.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$TUNNEL_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$LCP_TUNNEL_BIN</string>
+    <string>run</string>
+    <string>--profile-file</string>
+    <string>$LCP_TUNNEL_YAML</string>
+  </array>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>USER</key><string>$LCP_USER</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>Umask</key><integer>27</integer>
+  <key>StandardOutPath</key><string>$LOGS_DIR/tunnel.out.log</string>
+  <key>StandardErrorPath</key><string>$LOGS_DIR/tunnel.err.log</string>
+</dict>
+</plist>
+PLIST
+  chmod 600 "$LAUNCHD_DIR/$TUNNEL_LABEL.plist"
+}
+
+bootstrap_job() {
+  local label="$1" plist="$2"
+  if job_loaded "$label"; then
+    warn "$label already loaded"
+    return 0
+  fi
+  launchctl bootstrap "$GUID" "$plist" || die "failed to bootstrap $label"
+}
+
+unload_job() {
+  local label="$1"
+  if job_loaded "$label"; then
+    launchctl bootout "$GUID/$label" >/dev/null 2>&1 || true
+  fi
+  # Wait for the job's process to actually exit (ports handled by callers).
+}
+
+# ---------------------------------------------------------------------------
+# Ownership / state classification
+# ---------------------------------------------------------------------------
+# owned_by_us <label> <port> -> true when the listener on <port> belongs to the
+# launchd job <label> (the job's main pid is the listener, or is its parent).
+owned_by_us() {
+  local label="$1" port="$2" pid jpid
+  pid="$(listener_pid "$port")"
+  [ -n "$pid" ] || return 1
+  jpid="$(job_pid "$label")"
+  [ -n "$jpid" ] || return 1
+  [ "$pid" = "$jpid" ] && return 0
+  # child of the launchd job (defensive)
+  local cur="$pid"
+  local depth=0
+  while [ "$depth" -lt 5 ]; do
+    [ "$cur" = "$jpid" ] && return 0
+    cur="$(ps -p "$cur" -o ppid= 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$cur" ] || break
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+# report variables set by classify()
+#   server_listener, server_ours, tunnel_listener, tunnel_ours
+classify() {
+  server_listener="$(listener_pid "$SERVER_PORT")"
+  tunnel_listener="$(listener_pid "$TUNNEL_HEALTH_PORT")"
+  server_ours=no; tunnel_ours=no
+  [ -n "$server_listener" ] && owned_by_us "$SERVER_LABEL" "$SERVER_PORT" && server_ours=yes || true
+  [ -n "$tunnel_listener" ] && owned_by_us "$TUNNEL_LABEL" "$TUNNEL_HEALTH_PORT" && tunnel_ours=yes || true
+  return 0
+}
+
+# state_word -> ON / OFF / PARTIAL / ERROR
+state_word() {
+  local s="$(read_mode)"
+  local sh="off"; health_ok "$SERVER_PORT" && sh="ok"
+  local th="off"; ready_ok "$TUNNEL_HEALTH_PORT" && th="ok"
+  if [ -n "$server_listener" ] || [ -n "$tunnel_listener" ]; then
+    if [ "$server_ours" = "yes" ] && [ "$tunnel_ours" = "yes" ] && [ "$sh" = "ok" ] && [ "$th" = "ok" ]; then
+      printf 'ON'
+    else
+      printf 'PARTIAL'
+    fi
+  elif [ "$sh" = "ok" ] || [ "$th" = "ok" ]; then
+    printf 'PARTIAL'
+  else
+    printf 'OFF'
+  fi
+  return 0
+}
+
+# runtime_mode_word -> sets RUNTIME_MODE to the *actual* permission mode served
+# by the running MCP process, read from its live health endpoint:
+#   workspace | projects | full | read_only | unknown | unreachable
+# This is the ground truth used to keep the stored mode honest.
+RUNTIME_MODE=""
+runtime_mode_word() {
+  local health prof
+  RUNTIME_MODE="unreachable"
+  health_ok "$SERVER_PORT" || return 0
+  health="$(curl -fsS -m 5 "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null || true)"
+  [ -n "$health" ] || return 0
+  prof="$(printf '%s' "$health" | jq -r '.permission' 2>/dev/null || true)"
+  case "$prof" in
+    open:*) RUNTIME_MODE="full" ;;
+    workspace:*) RUNTIME_MODE="workspace" ;;
+    custom:*) RUNTIME_MODE="projects" ;;
+    read_only:*) RUNTIME_MODE="read_only" ;;
+    "") RUNTIME_MODE="unknown" ;;
+    *) RUNTIME_MODE="unknown" ;;
+  esac
+}
+
+# off_clean -> true only when everything LCP controls is actually down:
+# both launchd jobs unloaded, and no known deployment ports still listening.
+off_clean() {
+  if job_loaded "$SERVER_LABEL" || job_loaded "$TUNNEL_LABEL"; then return 1; fi
+  if [ -n "$(listener_pid "$SERVER_PORT")" ] || [ -n "$(listener_pid "$ADMIN_PORT")" ] \
+     || [ -n "$(listener_pid "$TUNNEL_HEALTH_PORT")" ]; then return 1; fi
+  return 0
+}
+
+# Durable worker registry (Phase 7C). The MCP server persists independently
+# running, owned workers here so `lcp off` can distinguish "everything stopped"
+# from "an owned worker may still be acting". The server writes it from its
+# cwd ($LCP_REPO); non-terminal, local-mcp-owned workers are the unsafe set.
+WORKER_INDEX="$LCP_REPO/.mcp-state/workers/index.json"
+
+# owned_workers_nonterminal -> newline-separated worker ids still considered
+# active (not completed/failed/cancelled/interrupted) and owned by local-mcp.
+owned_workers_nonterminal() {
+  [ -f "$WORKER_INDEX" ] || return 0
+  jq -r '.workers[] | select((.lifecycle_owner // "local-mcp") == "local-mcp") | select(.status != "completed" and .status != "failed" and .status != "cancelled" and .status != "interrupted") | .id' "$WORKER_INDEX" 2>/dev/null || true
+}
+
+# count_owned_workers -> number of non-terminal local-mcp-owned workers.
+count_owned_workers() {
+  local ids
+  ids="$(owned_workers_nonterminal)"
+  if [ -z "$ids" ]; then echo 0; else printf '%s\n' "$ids" | wc -l | tr -d ' '; fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_status() {
+  require_tools
+  ensure_state_dirs
+  classify
+  local st
+  st="$(state_word)"
+  local stored="$(read_mode)"
+  stored="${stored:-none}"
+
+  echo "State:                $st"
+  if [ -n "$server_listener" ]; then
+    echo "  MCP server:         running (pid $server_listener, owned-by-controller=$server_ours)"
+  else
+    echo "  MCP server:         not running"
+  fi
+  if [ -n "$tunnel_listener" ]; then
+    echo "  Tunnel:             running (pid $tunnel_listener, owned-by-controller=$tunnel_ours)"
+  else
+    echo "  Tunnel:             not running"
+  fi
+
+  # live server details
+  local health=""
+  if health_ok "$SERVER_PORT"; then
+    health="$(curl -fsS -m 5 "http://127.0.0.1:$SERVER_PORT/health")"
+    echo "  Server health:      ok"
+    echo "  OAuth authMode:     $(printf '%s' "$health" | jq -r '.authMode')"
+    echo "  Session recovery:   $(printf '%s' "$health" | jq -r '.sessionRecovery')"
+    local prof
+    prof="$(printf '%s' "$health" | jq -r '.permission')"
+    case "$prof" in
+      open:*) echo "  Access mode:        FULL MACHINE / YOLO (profile=open)" ;;
+      workspace:*) echo "  Access mode:        Workspace (profile=workspace)" ;;
+      custom:*) echo "  Access mode:        Projects (profile=custom)" ;;
+      read_only:*) echo "  Access mode:        read_only" ;;
+      *) echo "  Access mode:        $prof" ;;
+    esac
+    echo "  Permission profile:  $(printf '%s' "$health" | jq -r '.permission' | sed -E 's/:.*//')"
+    echo "  Full machine access: $(printf '%s' "$health" | jq -r '.fullMachineAccess')"
+    echo "  Unrestricted runtimes allowed: $(printf '%s' "$health" | jq -r '.fullMachineAccess')"
+    local roots
+    roots="$(printf '%s' "$health" | jq -r '.permission' | sed -E 's/^open:.*/unrestricted (open)/; s/^workspace:.*limited to ([^;]*).*/\1/; s/^custom:.*roots=([^;]*).*/\1/; s/^read_only:.*limited to ([^;]*).*/\1/' || true)"
+    echo "  Effective roots:     $roots"
+    echo "  Default workspace:   $(printf '%s' "$health" | jq -r '.workspace')"
+  else
+    echo "  Server health:      UNREACHABLE"
+  fi
+
+  if ready_ok "$TUNNEL_HEALTH_PORT"; then
+    echo "  Tunnel readiness:   ready"
+  else
+    echo "  Tunnel readiness:   not ready"
+  fi
+
+  # Persisted listeners, with correct ownership attribution. The Admin UI on
+  # port 3001 normally shares the MCP server process, so a listener there that
+  # belongs to the server job is expected, not an unrelated process.
+  for port in "$SERVER_PORT" "$ADMIN_PORT" "$TUNNEL_HEALTH_PORT"; do
+    local p
+    p="$(listener_pid "$port")"
+    [ -n "$p" ] || continue
+    local ownership=""
+    case "$port" in
+      "$SERVER_PORT")
+        if [ "$server_ours" = "yes" ]; then ownership="controller-owned"; else ownership="UNMANAGED"; fi
+        ;;
+      "$TUNNEL_HEALTH_PORT")
+        if [ "$tunnel_ours" = "yes" ]; then ownership="controller-owned"; else ownership="UNMANAGED"; fi
+        ;;
+      "$ADMIN_PORT")
+        if owned_by_us "$SERVER_LABEL" "$ADMIN_PORT"; then
+          ownership="controller-owned (shares MCP server pid $p)"
+        else
+          ownership="UNMANAGED"
+        fi
+        ;;
+    esac
+    echo "  Port $port:       listener pid $p ($ownership)"
+  done
+
+  # Owned delegated workers (durable registry; non-terminal local-mcp workers).
+  local owned
+  owned="$(count_owned_workers)"
+  echo "  Owned delegated workers:  $owned non-terminal recorded"
+  if [ "$owned" -gt 0 ]; then
+    echo "  Workers still active:     $(owned_workers_nonterminal | paste -sd, -)  (see $WORKER_INDEX)"
+  fi
+
+  # Stored vs actual permission state. `lcp status` must never imply agreement
+  # between the stored mode and the running profile when they differ.
+  local actual="n/a"
+  if [ "$server_ours" = "yes" ]; then
+    runtime_mode_word
+    actual="$RUNTIME_MODE"
+  fi
+  echo "Stored mode:          $stored"
+  echo "Actual runtime mode:  $actual"
+  if [ "$stored" = "none" ]; then
+    echo "Mode agreement:       n/a (nothing stored)"
+  elif [ "$actual" = "n/a" ] || [ "$actual" = "unreachable" ] || [ "$actual" = "unknown" ]; then
+    echo "Mode agreement:       unknown (cannot read runtime profile)"
+  elif [ "$stored" = "$actual" ]; then
+    echo "Mode agreement:       yes"
+  else
+    echo "Mode agreement:       NO — stored='$stored', actual='$actual'"
+    echo "Restart/switch pending: YES — run: lcp mode $stored  (or: lcp restart)"
+  fi
+}
+
+cmd_on() {
+  local mode="$1" perms_file started_server=no
+  require_tools
+  ensure_state_dirs
+  acquire_lock
+  CLEANUP_SERVER=no
+  CLEANUP_TUNNEL=no
+
+  classify
+
+  # Refuse duplicates / unknown owners.
+  if [ -n "$server_listener" ] && [ "$server_ours" != "yes" ]; then
+    die "port $SERVER_PORT is already in use by an unmanaged process (pid $server_listener). Refusing to take over blindly. Run: lcp migrate"
+  fi
+  if [ -n "$tunnel_listener" ] && [ "$tunnel_ours" != "yes" ]; then
+    die "port $TUNNEL_HEALTH_PORT is already in use by an unmanaged process (pid $tunnel_listener). Refusing to take over blindly. Run: lcp migrate"
+  fi
+
+  # Ground-truth mode of the running server (only meaningful when it is ours).
+  RUNTIME_MODE=""
+  if [ "$server_ours" = "yes" ]; then runtime_mode_word; fi
+
+  # Idempotent: already fully ON under our control. Never relabel a running
+  # server unless its actual runtime profile matches the requested mode.
+  if [ "$server_ours" = "yes" ] && [ "$tunnel_ours" = "yes" ]; then
+    if [ "$RUNTIME_MODE" != "$mode" ]; then
+      die "already ON but running mode is '$RUNTIME_MODE' (requested '$mode'); no change performed. Run: lcp mode $mode"
+    fi
+    info "already ON in mode $mode; nothing to do"
+    store_mode "$mode"
+    return 0
+  fi
+
+  # Server already running under our control in a different mode than the
+  # requested one: refuse rather than silently store a conflicting mode.
+  if [ "$server_ours" = "yes" ] && [ "$mode" != "$RUNTIME_MODE" ]; then
+    die "MCP server already running in mode '$RUNTIME_MODE' (requested '$mode'). Run: lcp mode $mode"
+  fi
+
+  # Full mode confirmation before touching anything.
+  if [ "$mode" = "full" ] && ! confirm_full; then
+    return 1
+  fi
+
+  perms_file="$(mode_permissions_file "$mode")"
+  store_mode "$mode"
+
+  # Server.
+  write_server_plist "$perms_file"
+  if [ "$server_ours" != "yes" ]; then
+    bootstrap_job "$SERVER_LABEL" "$LAUNCHD_DIR/$SERVER_LABEL.plist"
+    CLEANUP_SERVER=yes
+    if ! wait_for 40 health_ok "$SERVER_PORT"; then
+      die "MCP server failed to become healthy on port $SERVER_PORT (see $LOGS_DIR/server.err.log)"
+    fi
+    local health
+    health="$(curl -fsS -m 5 "http://127.0.0.1:$SERVER_PORT/health")"
+    if [ "$(printf '%s' "$health" | jq -r '.authMode')" != "oauth" ]; then
+      die "server health does not report authMode=oauth; aborting"
+    fi
+    local prof
+    prof="$(printf '%s' "$health" | jq -r '.permission')"
+    case "$mode" in
+      workspace) case "$prof" in workspace:*) ;; *) die "runtime permission profile mismatch: expected workspace, got: $prof" ;; esac ;;
+      projects)  case "$prof" in custom:*) ;; *) die "runtime permission profile mismatch: expected custom/projects, got: $prof" ;; esac ;;
+      full)      case "$prof" in open:*) ;; *) die "runtime permission profile mismatch: expected open, got: $prof" ;; esac ;;
+    esac
+    info "MCP server up on port $SERVER_PORT (authMode=oauth, profile=$(printf '%s' "$prof" | sed -E 's/:.*//'))"
+    started_server=yes
+    CLEANUP_SERVER=no
+  else
+    info "MCP server already up under this controller"
+  fi
+
+  # Tunnel.
+  write_tunnel_plist
+  if [ "$tunnel_ours" != "yes" ]; then
+    bootstrap_job "$TUNNEL_LABEL" "$LAUNCHD_DIR/$TUNNEL_LABEL.plist"
+    CLEANUP_TUNNEL=yes
+    if ! wait_for 30 ready_ok "$TUNNEL_HEALTH_PORT"; then
+      die "tunnel failed to become ready on port $TUNNEL_HEALTH_PORT (see $LOGS_DIR/tunnel.err.log)"
+    fi
+    info "Secure MCP Tunnel ready on port $TUNNEL_HEALTH_PORT"
+    CLEANUP_TUNNEL=no
+  else
+    info "Tunnel already ready under this controller"
+  fi
+
+  classify
+  echo "lcp: ON — mode=$mode, server pid=${server_listener:-none}, tunnel pid=${tunnel_listener:-none}, owned-by-controller=yes"
+  if [ "$started_server" = "yes" ]; then
+    open_dashboard
+  fi
+  if [ "$mode" = "full" ]; then
+    computer_use_accessibility_note 1
+  else
+    computer_use_accessibility_note 0
+  fi
+}
+
+cmd_off() {
+  local open_accessibility=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --accessibility) open_accessibility=1 ;;
+    esac
+    shift
+  done
+  require_tools
+  ensure_state_dirs
+  acquire_lock
+  classify
+
+  # Refuse to claim OFF while unmanaged processes still serve the ports.
+  if [ -n "$server_listener" ] && [ "$server_ours" != "yes" ]; then
+    die "port $SERVER_PORT is served by an unmanaged process (pid $server_listener); 'lcp off' cannot stop it. Run: lcp migrate"
+  fi
+  if [ -n "$tunnel_listener" ] && [ "$tunnel_ours" != "yes" ]; then
+    die "port $TUNNEL_HEALTH_PORT is served by an unmanaged process (pid $tunnel_listener); 'lcp off' cannot stop it. Run: lcp migrate"
+  fi
+
+  # Stop tunnel first (removes remote transport), then the server.
+  unload_job "$TUNNEL_LABEL"
+  unload_job "$SERVER_LABEL"
+  clear_mode
+
+  # OFF fails closed: we only report success once both launchd jobs are
+  # unloaded AND every managed deployment port has stopped listening.
+  if ! wait_for 20 off_clean; then
+    local remaining=""
+    if job_loaded "$SERVER_LABEL"; then remaining="$remaining server-job"; fi
+    if job_loaded "$TUNNEL_LABEL"; then remaining="$remaining tunnel-job"; fi
+    if [ -n "$(listener_pid "$SERVER_PORT")" ]; then remaining="$remaining port=$SERVER_PORT"; fi
+    if [ -n "$(listener_pid "$ADMIN_PORT")" ]; then remaining="$remaining port=$ADMIN_PORT"; fi
+    if [ -n "$(listener_pid "$TUNNEL_HEALTH_PORT")" ]; then remaining="$remaining port=$TUNNEL_HEALTH_PORT"; fi
+    echo "lcp: ERROR — OFF incomplete. Remaining:$remaining" >&2
+    return 1
+  fi
+
+  # OFF must also fail closed on owned delegated workers: after the jobs and
+  # ports are down, any worker the server still records as active is either a
+  # genuinely surviving process or stale metadata we cannot certify as stopped.
+  local working
+  working="$(count_owned_workers)"
+  if [ "$working" -gt 0 ]; then
+    local ids remaining_ids=""
+    ids="$(owned_workers_nonterminal)"
+    while IFS= read -r wid; do
+      [ -n "$wid" ] && remaining_ids="${remaining_ids:+$remaining_ids, }$wid"
+    done <<< "$ids"
+    echo "lcp: PARTIAL — OFF: MCP and tunnel stopped, but $working owned delegated worker(s) are still recorded active ($remaining_ids). Do not assume LCP-mediated work is fully stopped. Inspect and terminate them (e.g. Admin UI → Delegated workers → Cancel), or run: lcp status" >&2
+    return 2
+  fi
+
+  echo "lcp: OFF — MCP and tunnel stopped, auto-restart disabled, no owned workers remain"
+  computer_use_accessibility_note "$open_accessibility"
+}
+
+cmd_restart() {
+  local mode="${1:-}"
+  require_tools
+  ensure_state_dirs
+  classify
+  if [ "$server_ours" != "yes" ] && [ "$tunnel_ours" != "yes" ] \
+     && [ -z "$server_listener" ] && [ -z "$tunnel_listener" ]; then
+    info "currently OFF; starting fresh in mode '${mode:-workspace}'"
+    cmd_on "${mode:-workspace}"
+    return 0
+  fi
+  if [ -n "$server_listener" ] && [ "$server_ours" != "yes" ]; then
+    die "server is running but not owned by this controller; run: lcp migrate"
+  fi
+  if [ -n "$tunnel_listener" ] && [ "$tunnel_ours" != "yes" ]; then
+    die "tunnel is running but not owned by this controller; run: lcp migrate"
+  fi
+  local keep
+  keep="$(read_mode)"; keep="${keep:-workspace}"
+  if [ -n "$mode" ]; then
+    keep="$(normalize_mode "$mode")"
+  fi
+  echo "lcp: restarting in mode '$keep'. In-flight ChatGPT conversations will lose their MCP sessions; start a fresh conversation after the restart." >&2
+  cmd_off
+  cmd_on "$keep"
+}
+
+cmd_toggle() {
+  require_tools
+  ensure_state_dirs
+  classify
+  local st
+  st="$(state_word)"
+  case "$st" in
+    OFF)
+      info "currently OFF → starting in Workspace mode"
+      cmd_on workspace
+      ;;
+    ON)
+      info "currently ON → turning OFF"
+      cmd_off --accessibility
+      ;;
+    *)
+      die "state is $st (ambiguous/partial). Toggle will not guess. Check 'lcp status'; use 'lcp off' then 'lcp on [--mode ...]' to recover. Full mode is never enabled via toggle."
+      ;;
+  esac
+}
+
+cmd_mode() {
+  local mode="${1:-}"
+  if [ -z "$mode" ]; then
+    echo "lcp: mode requires one of: workspace|projects|full"
+    echo "  usage: lcp mode <workspace|projects|full>"
+    return 2
+  fi
+  mode="$(normalize_mode "$mode")"
+  if [ "$mode" = "full" ] && ! confirm_full; then
+    return 1
+  fi
+  # Controlled restart: off then on in the requested mode.
+  classify
+  if [ -n "$server_listener" ] || [ -n "$tunnel_listener" ]; then
+    echo "lcp: switching access mode requires a controlled restart; stopping current services." >&2
+    cmd_off
+  fi
+  cmd_on "$mode"
+  # Full/YOLO mode is where desktop automation (computer use) gets used; the
+  # node Accessibility TCC grant only changes interactively, so open the pane
+  # for the one-click toggle now rather than merely reminding.
+  if [ "$mode" = "full" ]; then
+    computer_use_accessibility_note 1
+  fi
+}
+
+# Internal: generate mode profile + both plists without starting anything.
+cmd_render() {
+  local mode="${1:-workspace}"
+  mode="$(normalize_mode "$mode")"
+  require_tools
+  ensure_state_dirs
+  local perms
+  perms="$(mode_permissions_file "$mode")"
+  write_server_plist "$perms"
+  write_tunnel_plist
+  echo "mode=$mode"
+  echo "permissions=$perms"
+  echo "server_plist=$LAUNCHD_DIR/$SERVER_LABEL.plist"
+  echo "tunnel_plist=$LAUNCHD_DIR/$TUNNEL_LABEL.plist"
+}
+
+cmd_migrate() {
+  require_tools
+  ensure_state_dirs
+  acquire_lock
+
+  # Refuse if already managed by this controller.
+  classify
+  if [ "$server_ours" = "yes" ] || [ "$tunnel_ours" = "yes" ]; then
+    die "services are already managed by this controller; nothing to migrate"
+  fi
+
+  local targets=() migrated=()
+  for port in "$SERVER_PORT" "$TUNNEL_HEALTH_PORT"; do
+    local pid cmd
+    pid="$(listener_pid "$port")"
+    if [ -z "$pid" ]; then continue; fi
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null | tr -s ' ' || true)"
+    # Only stop processes that are recognizably the MCP server or our tunnel.
+    case "$cmd" in
+      *"dist/index.js"*) targets+=("$pid"); info "identified MCP server pid $pid: $cmd" ;;
+      *"tunnel-client"*"--profile-file"*"$LCP_TUNNEL_YAML"*) targets+=("$pid"); info "identified tunnel pid $pid: $cmd" ;;
+      *) die "listener pid $pid on port $port is not a recognized MCP/tunnel process; refusing: $cmd" ;;
+    esac
+  done
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    info "no old MCP/tunnel processes found; starting fresh in Workspace mode"
+    cmd_on workspace
+    return 0
+  fi
+
+  info "planned takeover: stop these PIDs and start under launchd: ${targets[*]}"
+  if [ "${LCP_YES:-0}" != "1" ]; then
+    local ans=""
+    if [ ! -t 0 ]; then die "migration requires confirmation (interactive) or LCP_YES=1" ; fi
+    read -r -p "Stop these processes and migrate to the controller? [y/N] " ans
+    [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "lcp: migration cancelled." >&2; return 1; }
+  fi
+
+  for pid in "${targets[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  # Wait for both ports to close (server 3000, tunnel 8090).
+  local waited=0
+  while [ "$waited" -lt 20 ]; do
+    local still=0
+    for pid in "${targets[@]}"; do
+      kill -0 "$pid" 2>/dev/null && still=1
+    done
+    [ "$still" -eq 0 ] && break
+    sleep 1; waited=$((waited + 1))
+  done
+  for pid in "${targets[@]}"; do
+    kill -0 "$pid" 2>/dev/null && { warn "pid $pid did not exit; sending SIGKILL"; kill -KILL "$pid" 2>/dev/null || true; }
+  done
+  sleep 1
+  info "old processes stopped; starting under the controller in Workspace mode"
+  cmd_on workspace
+}
+
+usage() {
+  cat <<EOF
+lcp — Local ChatGPT Plus + Secure MCP Tunnel controller
+
+Usage:
+  lcp on [--mode workspace|projects|full]   Start (default: Workspace)
+  lcp off                                   Stop, disable auto-restart, open Accessibility pane for the node TCC grant
+  lcp status                                Report state, mode, health, ownership
+  lcp restart [--mode <m>]                  Controlled restart (preserves mode)
+  lcp toggle                                OFF→Workspace ON, ON→OFF (never Full)
+  lcp mode <workspace|projects|full>        Safe controlled switch of access mode
+  lcp migrate                               Take over legacy OMP/Terminal processes
+  lcp help                                  This help
+
+Full/YOLO mode (profile=open) requires explicit confirmation.
+EOF
+}
+
+cmd="$1"; shift || true
+case "$cmd" in
+  on)
+    mode="workspace"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --mode) shift; mode="$(normalize_mode "${1:-}")" ;;
+        --mode=*) mode="$(normalize_mode "${1#--mode=}")" ;;
+        --yes|--force) LCP_YES=1 ;;
+        *) die "unknown option for on: $1" ;;
+      esac
+      shift
+    done
+    LCP_ALLOW_OPEN=1
+    cmd_on "$mode"
+    ;;
+  off) cmd_off --accessibility ;;
+  status) cmd_status ;;
+  restart)
+    mode=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --mode) shift; mode="$(normalize_mode "${1:-}")" ;;
+        --mode=*) mode="$(normalize_mode "${1#--mode=}")" ;;
+        *) die "unknown option for restart: $1" ;;
+      esac
+      shift
+    done
+    cmd_restart "$mode"
+    ;;
+  toggle) cmd_toggle ;;
+  mode) cmd_mode "${1:-}" ;;
+  migrate) cmd_migrate ;;
+  _render) cmd_render "${1:-workspace}" ;;
+  _install) bash "$LCP_REPO/scripts/lcp-install.sh" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local ChatGPT Plus Admin</title>
+  <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <dialog id="admin-login" class="modal" aria-labelledby="admin-login-title">
+    <form id="admin-login-form" class="modal-body">
+      <div class="modal-head"><h3 id="admin-login-title">Unlock local Admin</h3></div>
+      <p class="muted">Enter your local ADMIN_TOKEN. It is exchanged for an HttpOnly session cookie and is not stored by this page.</p>
+      <label class="field"><span>Admin token</span><input id="admin-login-token" type="password" required autocomplete="off" spellcheck="false" /></label>
+      <p id="admin-login-error" class="muted" role="alert"></p>
+      <menu class="modal-foot"><button id="admin-login-submit" class="btn primary" type="submit">Unlock</button></menu>
+    </form>
+  </dialog>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div>
+          <div class="brand-title">Local ChatGPT Plus</div>
+          <div class="brand-sub">Admin · localhost</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-tab="dashboard">Overview</button>
+        <button class="nav-item" data-tab="servers">MCP Servers</button>
+        <button class="nav-item" data-tab="import">Import</button>
+        <button class="nav-item" data-tab="activity">Activity</button>
+        <button class="nav-item" data-tab="missions">Missions</button>
+        <button class="nav-item" data-tab="project">Project</button>
+        <button class="nav-item" data-tab="settings">Settings</button>
+        <button class="nav-item" data-tab="logs">Raw status</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="conn-status" class="conn-dot">Connecting…</div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <h1 id="page-title">Overview</h1>
+        <div class="topbar-actions">
+          <button type="button" class="btn ghost" id="refresh-all">Refresh</button>
+          <button type="button" class="btn ghost" id="admin-logout">Sign out</button>
+        </div>
+      </header>
+
+      <section id="dashboard" class="view active">
+        <div class="overview-hero">
+          <div>
+            <div class="overview-eyebrow">Local runtime</div>
+            <div class="overview-title-row">
+              <span id="overview-dot" class="status-dot online"></span>
+              <strong id="overview-state">Online</strong>
+              <span id="overview-last-tool" class="overview-last-tool">Last tool —</span>
+            </div>
+          </div>
+          <div class="overview-meta">
+            <span id="overview-transport" class="runtime-chip">—</span>
+            <span id="overview-updated" class="runtime-chip subtle">Updated —</span>
+          </div>
+        </div>
+        <div class="stat-grid" id="stat-grid"></div>
+        <div class="panel runtime-panel">
+          <div class="panel-head">
+            <h2>Active workspaces</h2>
+            <span id="dash-session-count" class="badge">0</span>
+          </div>
+          <div id="dash-sessions" class="runtime-list session-list"></div>
+        </div>
+        <div class="overview-split">
+          <div class="panel runtime-panel">
+            <div class="panel-head">
+              <h2>Active now</h2>
+              <span id="dash-active-count" class="badge">0</span>
+            </div>
+            <div id="dash-active" class="runtime-list"></div>
+          </div>
+          <div class="panel runtime-panel">
+            <div class="panel-head"><h2>Recent tool calls</h2></div>
+            <div id="dash-recent" class="runtime-list"></div>
+          </div>
+        </div>
+        <div class="panel runtime-panel">
+          <div class="panel-head"><h2>Tool efficiency</h2><span id="dash-usage-count" class="badge">0</span></div>
+          <div id="dash-usage" class="runtime-list"></div>
+        </div>
+        <div class="panel runtime-panel">
+          <div class="panel-head"><h2>Persistent telemetry</h2><span id="dash-persistent-count" class="badge">0</span></div>
+          <div id="dash-persistent-telemetry" class="runtime-list"></div>
+        </div>
+        <div class="overview-split">
+          <div class="panel runtime-panel">
+            <div class="panel-head"><h2>Agent plan</h2><span id="dash-task-count" class="badge">0</span></div>
+            <div id="dash-agent-task" class="runtime-list"></div>
+          </div>
+          <div class="panel runtime-panel">
+            <div class="panel-head"><h2>Operations</h2><span id="dash-operation-count" class="badge">0</span></div>
+            <div id="dash-operations" class="runtime-list"></div>
+          </div>
+        </div>
+        <div class="panel runtime-panel">
+          <div class="panel-head"><h2>Coding loops</h2><span id="dash-loop-count" class="badge">0</span></div>
+          <div id="dash-loops" class="runtime-list"></div>
+        </div>
+        <div class="panel runtime-panel">
+          <div class="panel-head"><h2>Edit transactions</h2><span id="dash-transaction-count" class="badge">0</span></div>
+          <div id="dash-transactions" class="runtime-list"></div>
+        </div>
+        <div class="panel runtime-panel">
+          <div class="panel-head"><h2>Context capsules</h2><span id="dash-capsule-count" class="badge">0</span></div>
+          <div id="dash-capsules" class="runtime-list"></div>
+        </div>
+        <div id="dash-state-errors" class="runtime-alert" hidden></div>
+        <div class="panel">
+          <div class="panel-head"><h2>Upstream servers</h2></div>
+          <div id="dash-servers" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section id="servers" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>MCP Servers</h2>
+            <button type="button" class="btn ghost" id="add-computer-use-presets">+ Computer-use presets</button>
+            <button type="button" class="btn primary" id="add-server">+ Add server</button>
+          </div>
+          <div id="servers-table" class="table-wrap"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Agent Skills</h2>
+            <button type="button" class="btn ghost" id="skills-refresh">Refresh skills</button>
+          </div>
+          <p class="muted">Enable or disable skills by project or globally. Global restrictions take precedence.</p>
+          <div class="inline-form">
+            <input type="text" id="skills-project-path" placeholder="Project path (blank = default workspace)" aria-label="Skills project root" />
+            <select id="skills-control-scope" aria-label="Skills control scope">
+              <option value="project">Current project</option>
+              <option value="global">Global</option>
+            </select>
+          </div>
+          <div id="skills-table" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section id="import" class="view">
+        <div class="panel">
+          <div class="panel-head"><h2>Import from IDE / CLI</h2></div>
+          <p class="muted">Automatically scan MCP configurations on this machine. Imports are merged; existing servers are not overwritten.</p>
+          <div id="import-grid" class="import-grid"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Import custom file</h2></div>
+          <div class="inline-form">
+            <input type="text" id="import-file-path" placeholder="~/Library/Application Support/Claude/claude_desktop_config.json" />
+            <select id="import-file-source">
+              <option value="cursor">Cursor / mcpServers</option>
+              <option value="claude">Claude Code / Desktop</option>
+              <option value="opencode">OpenCode</option>
+            </select>
+            <button type="button" class="btn primary" id="import-file-btn">Import</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="activity" class="view">
+        <div id="activity-status-bar" class="status-bar" aria-live="polite"></div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Running now</h2>
+            <span id="activity-running-count" class="badge">0</span>
+          </div>
+          <div id="activity-running" class="runtime-list">
+            <div class="runtime-empty">No tool calls currently running.</div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Tool calls · ChatGPT</h2>
+            <div class="activity-toolbar">
+              <select id="activity-kind" aria-label="Filter by type">
+                <option value="all">All</option>
+                <option value="mcp">ChatGPT MCP</option>
+                <option value="tool">Tool execution</option>
+                <option value="session">Session</option>
+              </select>
+              <select id="activity-status" aria-label="Filter by status">
+                <option value="all">All statuses</option>
+                <option value="error">Errors only</option>
+              </select>
+              <input type="search" id="activity-search" placeholder="Search tool or path…" />
+              <label class="activity-live">
+                <input type="checkbox" id="activity-live" checked />
+                <span>Live</span>
+              </label>
+              <button type="button" class="btn ghost sm" id="activity-clear">Clear view</button>
+            </div>
+          </div>
+          <div id="activity-live-state" class="activity-live-state"></div>
+          <div id="activity-feed" class="activity-feed">
+            <div class="empty">No activity yet. Call a tool from ChatGPT to see it here.</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="missions" class="view">
+        <div id="missions-status-bar" class="status-bar" aria-live="polite"></div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Active missions (task registry)</h2>
+            <span id="missions-count" class="badge">0</span>
+          </div>
+          <p class="muted">Persistent agent-task records shared through the Local ChatGPT Plus MCP server. A second ChatGPT conversation can read and update the same mission via <code>@Local ChatGPT Plus</code> using the mission id — the human starts that conversation.</p>
+          <div id="missions-board" class="missions-board"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Needs my attention</h2></div>
+          <div id="missions-attention" class="runtime-list"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Delegated workers</h2><span id="workers-count" class="badge">0</span></div>
+          <p class="muted">Independently-running owned workers (e.g. OMP/model-backed subagents). ChatGPT-direct tool calls are not separate workers.</p>
+          <div id="workers-list" class="runtime-list"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Delegation readiness</h2></div>
+          <div id="readiness-panel" class="runtime-list"></div>
+        </div>
+      </section>
+
+      <section id="project" class="view">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Workspace recovery review</h2>
+            <button type="button" class="btn ghost" id="recovery-review-btn">Review records</button>
+          </div>
+          <p class="muted">Read-only. Select one project explicitly. No tasks, loops, or transactions will be changed.</p>
+          <div class="inline-form">
+            <input type="text" id="recovery-workspace" aria-label="Workspace path to review" placeholder="Project path (required)" autocomplete="off" />
+            <select id="recovery-stale-hours" aria-label="Minimum inactive age">
+              <option value="24">Older than 24h</option>
+              <option value="168">Older than 7 days</option>
+              <option value="720">Older than 30 days</option>
+            </select>
+          </div>
+          <div id="recovery-review-results" class="runtime-list" aria-live="polite">
+            <div class="muted">Enter a workspace and choose Review records. Nothing has been scanned.</div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>MCP instructions (ChatGPT context)</h2></div>
+          <p class="muted">Content injected into each MCP session — CLAUDE.md, Git state, and agent instructions.</p>
+          <div id="project-meta" class="stat-grid"></div>
+          <pre id="project-preview" class="code-block" style="max-height:420px;overflow:auto"></pre>
+        </div>
+      </section>
+
+      <section id="settings" class="view">
+        <div class="panel">
+          <div class="panel-head"><h2>Environment (.env)</h2></div>
+          <form id="env-form" class="env-grid"></form>
+          <div class="form-actions">
+            <button type="button" class="btn primary" id="save-env">Save .env</button>
+            <span class="muted">Some values require a server restart.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="logs" class="view">
+        <div class="panel">
+          <pre id="status-json" class="code-block"></pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="server-dialog" class="modal">
+    <form method="dialog" id="server-form" class="modal-body">
+      <div class="modal-head">
+        <h3 id="dialog-title">MCP Server</h3>
+        <button type="button" class="btn icon" id="close-dialog" aria-label="Close">×</button>
+      </div>
+      <div class="form-grid">
+        <label class="field"><span>ID</span><input name="id" required /></label>
+        <label class="field"><span>Display name</span><input name="name" /></label>
+        <label class="field checkbox"><input name="enabled" type="checkbox" checked /><span>Enable server</span></label>
+        <label class="field"><span>Transport</span>
+          <select name="transport"><option value="stdio">stdio</option><option value="http">http</option></select>
+        </label>
+        <label class="field stdio-field"><span>Command</span><input name="command" /></label>
+        <label class="field stdio-field span-2"><span>Args (JSON array)</span><input name="args" placeholder='["path/to/server.js"]' /></label>
+        <label class="field stdio-field span-2"><span>Working directory</span><input name="cwd" /></label>
+        <label class="field http-field span-2"><span>URL</span><input name="url" placeholder="http://127.0.0.1:3100/mcp" /></label>
+        <label class="field http-field"><span>Auth</span>
+          <select name="auth_type"><option value="auto">auto (OAuth discovery)</option><option value="oauth">oauth</option><option value="none">none/static</option></select>
+        </label>
+        <label class="field http-field"><span>OAuth scope (optional)</span><input name="oauth_scope" /></label>
+        <label class="field http-field"><span>Bearer token env</span><input name="bearer_token_env_var" placeholder="MY_MCP_TOKEN" /></label>
+        <label class="field http-field span-2"><span>Headers (JSON)</span><input name="headers" placeholder='{"X-API-Key":"..."}' /></label>
+        <label class="field"><span>Tool prefix</span><input name="tool_prefix" /></label>
+        <label class="field"><span>Expose</span><select name="expose"><option value="all">all</option><option value="allowlist">allowlist</option><option value="meta_only">meta_only</option><option value="none">none</option></select></label>
+        <label class="field span-2"><span>Allowlist (comma-separated)</span><input name="tools" placeholder="tool_a, tool_b" /></label>
+        <label class="field"><span>Idle timeout (s)</span><input name="idle_timeout_sec" type="number" value="600" /></label>
+      </div>
+      <menu class="modal-foot">
+        <button type="button" class="btn ghost" value="cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="save-server">Save</button>
+      </menu>
+    </form>
+  </dialog>
+
+
+  <dialog id="codex-hooks-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Codex hooks</h3><button type="button" class="btn icon" id="close-codex-hooks" aria-label="Close">×</button></div><p class="muted">Automatically scans enabled Codex plugins. Only <code>SessionStart</code> hooks can currently run through ChatGPT MCP; prompt and subagent events are shown for visibility but cannot run here.</p><div id="codex-hooks-list" class="tools-list"></div><menu class="modal-foot"><button type="button" class="btn primary" id="save-codex-hooks">Save</button></menu></div></dialog>
+
+  <dialog id="local-tools-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Local tools</h3><button type="button" class="btn icon" id="close-local-tools" aria-label="Close">×</button></div><p class="muted">Force-enable tools outside the <code>slim</code> profile, or disable any local tool. This does not affect upstream MCP tools.</p><div id="local-tools-list" class="tools-list"></div><menu class="modal-foot"><button type="button" class="btn primary" id="save-local-tools">Save</button></menu></div></dialog>
+
+  <dialog id="permissions-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Permissions</h3><button type="button" class="btn icon" id="close-permissions" aria-label="Close">×</button></div><p class="muted">Application-level Local ChatGPT Plus policy. <code>open</code> preserves full local access; restricted profiles are not an OS sandbox.</p><textarea id="permissions-json" class="code-block" spellcheck="false" style="width:100%;min-height:300px;resize:vertical"></textarea><menu class="modal-foot"><button type="button" class="btn primary" id="save-permissions">Save</button></menu></div></dialog>
+
+  <dialog id="local-hooks-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Local hooks</h3><button type="button" class="btn icon" id="close-local-hooks" aria-label="Close">×</button></div><p class="muted">Native session/tool/subagent hooks. Blocking hooks can deny an operation; hook commands still obey the active permission policy.</p><textarea id="local-hooks-json" class="code-block" spellcheck="false" style="width:100%;min-height:300px;resize:vertical"></textarea><menu class="modal-foot"><button type="button" class="btn primary" id="save-local-hooks">Save</button></menu></div></dialog>
+
+  <dialog id="subagents-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Subagents</h3><button type="button" class="btn icon" id="close-subagents" aria-label="Close">×</button></div><p class="muted">Configure an external model-capable runner. This cannot reuse the parent ChatGPT app subscription. Secret environment values are never returned by this editor.</p><div id="subagents-env-keys" class="muted" style="margin-bottom:8px"></div><textarea id="subagents-json" class="code-block" spellcheck="false" style="width:100%;min-height:300px;resize:vertical"></textarea><menu class="modal-foot"><button type="button" class="btn primary" id="save-subagents">Save</button></menu></div></dialog>
+
+  <dialog id="tools-dialog" class="modal">
+    <div class="modal-body">
+      <div class="modal-head"><h3>Tools</h3><button type="button" class="btn icon" id="close-tools">×</button></div>
+      <div id="tools-list" class="tools-list"></div>
+    </div>
+  </dialog>
+
+  <script src="action-glossary.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
