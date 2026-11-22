@@ -1,8 +1,63 @@
+<div align="center">
+
+<img src="assets/local-chatgpt-plus-mark.svg" width="112" height="112" alt="Local ChatGPT Plus connected-terminal and agent-network logo" />
+
 # Local ChatGPT Plus
 
-A self-hosted MCP server that lets ChatGPT inspect and edit local code, run tests and commands, manage Git, and use additional agent workflows on macOS.
+### A low-cost, self-hosted MCP coding orchestrator.
 
-The **core coding workflow** stays simple: explore → read → patch → verify → review. Advanced features remain available, including persistent tasks, coding loops, context capsules, edit transactions, rewind, LSP, PTY, subagents, upstream MCP, and browser/desktop computer use.
+**Your machine · Your tools · Your agents · Your choice of models**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-22a06b)](LICENSE)
+[![MCP](https://img.shields.io/badge/Model_Context_Protocol-MCP-6554c0)](https://modelcontextprotocol.io/)
+[![Node.js](https://img.shields.io/badge/Node.js-22.22.2%2B-43853d?logo=node.js&logoColor=white)](package.json)
+[![macOS](https://img.shields.io/badge/Platform-macOS-25324b?logo=apple&logoColor=white)](docs/OPERATIONS.md)
+[![Open Source](https://img.shields.io/badge/Open_Source-yes-2ea043)](LICENSE)
+[![Release security](https://github.com/darizae/local-chatgpt-plus/actions/workflows/release-security.yml/badge.svg)](https://github.com/darizae/local-chatgpt-plus/actions/workflows/release-security.yml)
+
+**Open-source AI agent infrastructure that connects ChatGPT to local development tools and parallel coding subagents.**
+
+[Quick start](#requirements-and-quick-start) · [How it works](#-how-it-works) · [Security & OAuth](#security-model) · [Agent setup](docs/OPEN_SOURCE_SETUP.md) · [Admin passkeys](docs/ADMIN_PASSKEYS.md) · [Documentation](#documentation-and-attribution)
+
+</div>
+
+---
+
+## ✦ The idea
+
+Built a self-hosted **Model Context Protocol (MCP) application** that connects ChatGPT to a developer's local machine, enabling it to inspect and modify code, execute tests, manage Git repositories, and coordinate multiple coding subagents.
+
+Designed as a **low-cost, model-flexible alternative to expensive cloud-only AI coding orchestration**: developers can delegate tasks to different model providers, use local execution resources, and maintain control of their development environment.
+
+The core workflow is **explore → read → patch → verify → review**. Run local coding workers in parallel and choose hosted or locally available agents for each task rather than relying on one expensive orchestration model. Actual model/API charges depend on the providers you select; no fixed savings percentage is implied.
+
+## ✦ How it works
+
+```mermaid
+flowchart LR
+    U["ChatGPT<br/>MCP client"] -->|"OAuth 2.1 / OIDC"| T["Secure HTTPS<br/>MCP tunnel"]
+    T --> S["Local MCP server<br/>macOS · Node.js"]
+    S --> P["Tool scopes +<br/>permission policy"]
+    P --> D["Files · Git · PTY<br/>tests · LSP"]
+    P --> O["Subagent orchestration<br/>parallel tasks + Git worktrees"]
+    O --> M["Selected coding agents<br/>local or hosted models"]
+    S --> ST["Durable tasks<br/>audit + recovery"]
+    A["Loopback-only Admin UI<br/>WebAuthn passkeys"] -.-> S
+```
+
+| Capability | What it enables |
+| --- | --- |
+| **Parallel agent orchestration** | Spawn and monitor local coding workers, select model providers, and keep task state across sessions. |
+| **Developer tooling** | Search and edit files, run commands and tests, use PTY/LSP tooling, inspect Git and create isolated worktrees. |
+| **Configurable execution** | Start in workspace or project-restricted application profiles; run a worker inside a separate OS-level sandbox or container when stronger isolation is required. |
+| **Layered access controls** | OAuth scopes for MCP, local permission policies, audit logging, a loopback-only Admin interface, and WebAuthn/Touch ID for Admin sign-in. |
+| **Self-hosted operations** | Run the MCP server and HTTPS tunnel under macOS `launchd`, with a local dashboard and documented agent-assisted setup. |
+
+**Sandboxing note:** A workspace profile or Git worktree is *not* an operating-system sandbox. Local shell tools run with their OS account's privileges. Use a separate restricted account, container, or VM for actual isolation, particularly with untrusted code. See [Security model](#security-model).
+
+## ✦ Tech stack
+
+**TypeScript · Node.js · Express · Model Context Protocol (MCP) · OAuth 2.1 / OIDC · WebAuthn / FIDO2 · Git · GitHub Actions · macOS launchd · Language Server Protocol (LSP) · PTY · REST / Server-Sent Events**
 
 ## Requirements and quick start
 
@@ -26,6 +81,12 @@ npm start
 The local MCP server defaults to `http://127.0.0.1:3000`; check `http://127.0.0.1:3000/health`. The optional **Admin UI** is available at `http://localhost:3001/ui/` when enabled and **requires a locally generated `ADMIN_TOKEN`** for bootstrapping and recovery. On macOS, you can also enroll a [Touch ID / Apple Passwords passkey](docs/ADMIN_PASSKEYS.md) for routine Admin login. Passkeys are bound to `localhost` (not numeric `127.0.0.1`); the Admin server still binds to loopback. Browser access requires an HttpOnly same-site cookie **and** a separate origin-scoped session proof (because localhost cookies cross ports), plus CSRF on writes; local automation may use a Bearer token. The new-install defaults disable Admin and ChatGPT auto-approval. Enabling Admin also enables its settings and upstream OAuth callback endpoints. Never tunnel Admin. The terminal dashboard starts automatically in an interactive terminal; set `LOCAL_CODER_TUI=off` for normal logs.
 
 **Security:** Set `MCP_TOKEN` before exposing port 3000 through a tunnel. The default `workspace` permission profile narrows direct path parameters, but shell commands still run with the user's OS privileges; `WORKSPACE_PATH` changes the default directory but is **not a sandbox**. Never tunnel the Admin port, and keep the tokenized MCP URL secret. See [Security details](docs/OPERATIONS.md#security-details).
+
+## ✦ Agent-assisted setup
+
+You can give [the installation guide](docs/OPEN_SOURCE_SETUP.md) directly to a local coding agent. It separates setup that an agent can verify (dependencies, configuration, build and tests) from manual steps that require your approval (OAuth consent, tunnel provisioning and any Apple Passwords passkey enrollment).
+
+> Clone `darizae/local-chatgpt-plus` and follow `docs/OPEN_SOURCE_SETUP.md`. Configure an isolated workspace with the default restrictive profile, build and run the tests, and report all manual authentication and tunnel steps. Never log or commit secrets, silently enable Full mode, or treat the application-level workspace guard as an OS sandbox.
 
 ## Security model
 
