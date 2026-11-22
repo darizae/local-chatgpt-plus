@@ -101,8 +101,14 @@ export function startAdminServer(options: AdminServerOptions): Server {
     instructionsPreview: options.instructionsPreview,
   }));
 
-  return app.listen(options.port, host, () => {
+  const server = app.listen(options.port, host, () => {
     console.log(`  Admin UI:  http://${host}:${options.port}/ui`);
     console.log(`  Admin API: http://${host}:${options.port}/health`);
   });
+  process.once("exit", adminSecurity.release);
+  server.once("close", () => {
+    process.removeListener("exit", adminSecurity.release);
+    adminSecurity.release();
+  });
+  return server;
 }

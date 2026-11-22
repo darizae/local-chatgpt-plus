@@ -36,14 +36,20 @@ try {
   });
   await new Promise((resolve) => server.once("listening", resolve));
   const port = server.address().port;
+  assert.throws(() => startAdminServer({
+    host: "127.0.0.1", port: 0, mcpPort: 0, pid: process.pid,
+    transportMode: "json", keepAliveMs: 0, manager, sessionCount: () => 0,
+  }), /passkey registry.*used|passkey registry.*locked/i,
+  "another Admin instance must not reuse a registry concurrently");
   const origin = `http://localhost:${port}`;
   const base = `http://127.0.0.1:${port}`;
 
-  async function request(endpoint, { method = "GET", cookie = "", csrf = "", body, host = "localhost" } = {}) {
+  async function request(endpoint, { method = "GET", cookie = "", csrf = "", proof = "", body, host = "localhost" } = {}) {
     const headers = { Host: `${host}:${port}` };
     if (method !== "GET") headers.Origin = host === "localhost" ? origin : `http://${host}:${port}`;
     if (cookie) headers.Cookie = cookie;
     if (csrf) headers["X-LCP-Admin-CSRF"] = csrf;
+    if (proof) headers["X-LCP-Admin-Proof"] = proof;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     return await new Promise((resolve, reject) => {
       // Node's fetch ignores Host overrides. A raw local HTTP request allows
@@ -91,13 +97,17 @@ try {
   const tokenCookie = login.cookie.split(";")[0];
   assert.match(tokenCookie, /lcp_admin_session=/);
   const csrf = login.data.csrf;
+  const tokenProof = login.data.proof;
+  assert.ok(tokenProof && tokenProof !== csrf);
+  assert.equal((await request("/api/auth/session", { cookie: tokenCookie })).response.status, 401,
+    "the hostname-scoped cookie alone must never authenticate");
   const blockedCsrf = await request(prefix + "/registration/options", {
-    method: "POST", cookie: tokenCookie,
+    method: "POST", cookie: tokenCookie, proof: tokenProof,
   });
   assert.equal(blockedCsrf.response.status, 403);
 
   const registration = await request(prefix + "/registration/options", {
-    method: "POST", cookie: tokenCookie, csrf,
+    method: "POST", cookie: tokenCookie, csrf, proof: tokenProof,
   });
   assert.equal(registration.response.status, 200);
   assert.equal(registration.data.options.rp.id, "localhost");
@@ -153,17 +163,17 @@ try {
   wrongData.challenge = base64(Buffer.from("another-challenge"));
   wrongChallenge.response.clientDataJSON = base64(Buffer.from(JSON.stringify(wrongData)));
   const invalidRegistration = await request(prefix + "/registration/verify", {
-    method: "POST", cookie: tokenCookie, csrf, body: wrongChallenge,
+    method: "POST", cookie: tokenCookie, csrf, proof: tokenProof, body: wrongChallenge,
   });
   assert.equal(invalidRegistration.response.status, 400);
   const consumedRegistration = await request(prefix + "/registration/verify", {
-    method: "POST", cookie: tokenCookie, csrf, body: assertion,
+    method: "POST", cookie: tokenCookie, csrf, proof: tokenProof, body: assertion,
   });
   assert.equal(consumedRegistration.response.status, 400);
   assert.equal((await request(prefix + "/status")).data.registered, false);
 
   const renewedRegistration = await request(prefix + "/registration/options", {
-    method: "POST", cookie: tokenCookie, csrf,
+    method: "POST", cookie: tokenCookie, csrf, proof: tokenProof,
   });
   assert.equal(renewedRegistration.response.status, 200);
   const newClient = Buffer.from(JSON.stringify({
@@ -171,7 +181,7 @@ try {
   }));
   assertion.response.clientDataJSON = base64(newClient);
   const approvedRegistration = await request(prefix + "/registration/verify", {
-    method: "POST", cookie: tokenCookie, csrf, body: assertion,
+    method: "POST", cookie: tokenCookie, csrf, proof: tokenProof, body: assertion,
   });
   assert.equal(approvedRegistration.response.status, 200);
   assert.equal((await request(prefix + "/status")).data.registered, true);
@@ -183,6 +193,11 @@ try {
   assert.match(authOptions.cookie, /HttpOnly/);
   const challengeCookie = authOptions.cookie.split(";")[0];
   const opts = authOptions.data.options;
+  // Anonymous high-rate option requests cannot evict an already-issued
+  // signed challenge because issuance carries no server-side FIFO state.
+  for (let i = 0; i < 80; i++) {
+    assert.equal((await request(prefix + "/authentication/options", { method: "POST" })).response.status, 200);
+  }
   assert.equal(opts.rpId, "localhost");
   assert.equal(opts.userVerification, "required");
 
@@ -202,6 +217,11 @@ try {
     clientExtensionResults: {},
   };
 
+  const tamperedChallengeCookie = challengeCookie.slice(0, -1) +
+    (challengeCookie.endsWith("a") ? "b" : "a");
+  assert.equal((await request(prefix + "/authentication/verify", {
+    method: "POST", cookie: tamperedChallengeCookie, body: authentication,
+  })).response.status, 400, "a tampered signed challenge cookie must be rejected");
   const valid = await request(prefix + "/authentication/verify", {
     method: "POST", cookie: challengeCookie, body: authentication,
   });
@@ -209,9 +229,11 @@ try {
   assert.equal(valid.data.authenticated, true);
   const passkeyCookie = valid.cookie.split(",").find((item) => item.includes("lcp_admin_session="))?.split(";")[0]?.trim() ||
     valid.response.headers.getSetCookie().find((s) => s.includes("lcp_admin_session=")).split(";")[0];
+  const passkeyProof = valid.data.proof;
   assert.ok(passkeyCookie);
-  assert.equal((await request("/api/upstream", { cookie: passkeyCookie })).response.status, 200);
-  const session = await request("/api/auth/session", { cookie: passkeyCookie });
+  assert.ok(passkeyProof && passkeyProof !== tokenProof);
+  assert.equal((await request("/api/upstream", { cookie: passkeyCookie, proof: passkeyProof })).response.status, 200);
+  const session = await request("/api/auth/session", { cookie: passkeyCookie, proof: passkeyProof });
   assert.equal(session.data.viaToken, false);
 
   const replay = await request(prefix + "/authentication/verify", {
@@ -253,24 +275,40 @@ try {
     "authentication must check the localhost RP hash");
 
   const untrustedManage = await request(prefix + "/registration/options", {
-    method: "POST", cookie: passkeyCookie, csrf: session.data.csrf,
+    method: "POST", cookie: passkeyCookie, proof: passkeyProof, csrf: session.data.csrf,
   });
   assert.equal(untrustedManage.response.status, 403, "passkey-only sessions cannot add new passkeys");
 
   // Revoke with a token-authenticated session; credential stays in Apple
   // Passwords until the user also deletes it there.
   const revoked = await request(prefix + "/revoke", {
-    method: "POST", cookie: tokenCookie, csrf, body: { id: credentialID64 },
+    method: "POST", cookie: tokenCookie, csrf, proof: tokenProof, body: { id: credentialID64 },
   });
   assert.equal(revoked.response.status, 200);
   assert.equal((await request(prefix + "/status")).data.registered, false);
-  assert.equal((await request("/api/upstream", { cookie: passkeyCookie })).response.status, 401,
+  assert.equal((await request("/api/upstream", { cookie: passkeyCookie, proof: passkeyProof })).response.status, 401,
     "revoking a passkey must immediately invalidate sessions created with that passkey");
-  assert.equal((await request("/api/upstream", { cookie: tokenCookie })).response.status, 200,
+  assert.equal((await request("/api/upstream", { cookie: tokenCookie, proof: tokenProof })).response.status, 200,
     "recovery token sessions must survive passkey revocation");
 
   await new Promise((resolve) => server.close(resolve));
   server = undefined;
+  assert.equal(await fs.stat(storePath + ".lock").then(() => true, () => false), false,
+    "graceful Admin shutdown must release the registry lock");
+
+  // Simulate an unclean crash leaving a lock for a PID that no longer runs.
+  const staleLock = storePath + ".lock";
+  await fs.writeFile(staleLock, JSON.stringify({ pid: 2147483647, nonce: "synthetic" }), { mode: 0o600 });
+  const oldTime = new Date(Date.now() - 10_000);
+  await fs.utimes(staleLock, oldTime, oldTime);
+  server = startAdminServer({
+    host: "127.0.0.1", port: 0, mcpPort: 0, pid: process.pid,
+    transportMode: "json", keepAliveMs: 0, manager, sessionCount: () => 0,
+  });
+  await new Promise((resolve) => server.once("listening", resolve));
+  await new Promise((resolve) => server.close(resolve));
+  server = undefined;
+  assert.equal(await fs.stat(staleLock).then(() => true, () => false), false);
   await fs.writeFile(storePath, "{invalid JSON", { mode: 0o600 });
   assert.throws(() => startAdminServer({
     host: "127.0.0.1", port: 0, mcpPort: 0, pid: process.pid,

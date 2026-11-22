@@ -81,10 +81,16 @@ try {
     const cookie = cookieLine.split(";")[0];
     const loginBody = await login.json();
     const csrf = loginBody.csrf;
+    const proof = loginBody.proof;
     assert.ok(csrf && csrf !== realToken);
+    assert.ok(proof && proof !== csrf && proof !== realToken, "session origin proof is independent");
     assert.ok(!JSON.stringify(loginBody).includes(realToken), "login response must not echo Admin token");
 
-    const withCookie = { Cookie: cookie };
+    assert.equal((await req("/api/auth/session", "GET", { Cookie: cookie })).status, 401,
+      "a localhost session cookie stolen by another local port must be useless");
+    assert.equal((await req("/api/upstream", "GET", { Cookie: cookie, "x-lcp-admin-csrf": csrf })).status, 401,
+      "CSRF token cannot replace origin-scoped session proof");
+    const withCookie = { Cookie: cookie, "x-lcp-admin-proof": proof };
     const session = await req("/api/auth/session", "GET", withCookie);
     assert.equal(session.status, 200);
     assert.equal((await session.json()).csrf, csrf);

@@ -25,7 +25,7 @@ sequenceDiagram
     participant Admin as Local Admin (localhost:3001)
     participant Store as Local private registry (0600)
     User->>Admin: Sign in once with recovery ADMIN_TOKEN
-    Admin-->>Safari: HttpOnly session + in-memory CSRF token
+    Admin-->>Safari: HttpOnly cookie + separate origin-only session proof + CSRF
     User->>Admin: Add passkey (token-authenticated session)
     Admin-->>Safari: Random registration challenge, RP ID localhost
     Safari->>User: Touch ID / device verification
@@ -36,18 +36,18 @@ sequenceDiagram
     Safari->>User: Touch ID / device verification
     Safari->>Admin: Signed challenge, bound to exact origin
     Admin->>Store: Verify signature, save updated counter
-    Admin-->>Safari: New HttpOnly session cookie
+    Admin-->>Safari: New HttpOnly cookie and origin-only proof
 ```
 
-The server enforces the exact **`http://localhost:3001` origin** (including port), RP ID `localhost`, a one-time 120-second challenge, and user verification. A different origin, missing user verification, or a reused challenge is rejected. Challenge state is held in process memory and discarded on restart.
+The server enforces the exact **`http://localhost:3001` origin** (including port), RP ID `localhost`, a one-time 120-second challenge, and user verification. A different origin, missing user verification, or a reused challenge is rejected. Login challenges use signed, HttpOnly, short-lived cookies with a bounded replay cache, avoiding any unauthenticated issued-challenge FIFO that another local process could evict; the signing key and replay cache are process-local.
 
-Passkeys authenticate the Admin **browser**. Local automation may continue to use the Admin token in a Bearer header; it does not need access to the passkey private key.
+Passkeys authenticate the Admin **browser**. Admin browser sessions also require an independently random proof sent in an HTTP header and held in **origin-scoped sessionStorage**: a stolen `localhost` cookie alone is useless, even though cookies are shared across localhost ports. New tabs without the proof must sign in again. The Admin server does not persist the proof; browser session storage is isolated by origin but may be restored by the browser after a crash. Local automation may continue to use the Admin token in a Bearer header; it does not need access to the passkey private key.
 
 ## Recovery, revocation and privacy
 
 - **Keep `ADMIN_TOKEN` as the recovery method.** Enrolling a passkey does not disable it. This is deliberate: losing the passkey or switching Macs should not lock out the administrator. Store the recovery token separately and securely.
 - To register another passkey or revoke an existing one, sign in using the Admin **token** rather than passkey login. Click **Manage passkeys** to revoke the public credential on the server; revocation also invalidates any existing passkey-authenticated browser sessions. If necessary, remove the matching saved passkey from Apple Passwords as a separate manual step.
-- The default server-side registry is `~/.local/lcp/state/admin-passkeys.json` (**mode 0600**, with state directory restricted to the user). Override it only with a secure absolute `ADMIN_PASSKEY_FILE` path for tests/advanced setups. Never commit it to Git, expose it from Admin responses, or place it inside the public repository.
+- The default server-side registry is `~/.local/lcp/state/admin-passkeys.json` (**mode 0600**, with state directory restricted to the user). Only one Admin process may hold its private registry lock at a time; an orphaned lock from a confirmed-dead process is recovered. Override the path only with a secure absolute `ADMIN_PASSKEY_FILE` for tests/advanced setups. Never commit either file, expose it from Admin responses, or place it inside the public repository.
 - The registry stores an opaque user handle, credential IDs, **public keys**, counters, optional transports and enrollment timestamps. It contains **no Apple private key, password, Admin token, credential signing secret or biometric data**.
 - If the registry is lost, passkey login stops working; sign in with the token and enroll again. If the Admin token is rotated, old browser sessions are invalidated but registered passkeys remain until revoked.
 - **Security limitation:** The Admin port is loopback-only, but malware running under the same macOS account may already access local files and processes. Passkeys do not sandbox local shell tools or replace the separate MCP OAuth authorization boundary.

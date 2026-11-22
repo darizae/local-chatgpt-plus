@@ -74,6 +74,20 @@ function toast(msg, isError = false) {
 }
 
 let adminCsrf = "";
+// Never trust the localhost session cookie alone: cookies cross ports, while
+// sessionStorage is isolated by origin (including the Admin port).
+const ADMIN_PROOF_STORAGE_KEY = "lcp-admin-origin-proof";
+function readStoredAdminProof() {
+  try { return sessionStorage.getItem(ADMIN_PROOF_STORAGE_KEY) || ""; } catch { return ""; }
+}
+function storeAdminProof(proof) {
+  try { sessionStorage.setItem(ADMIN_PROOF_STORAGE_KEY, proof); }
+  catch { throw new Error("Browser session storage is required for secure Admin login."); }
+}
+function clearStoredAdminProof() {
+  try { sessionStorage.removeItem(ADMIN_PROOF_STORAGE_KEY); } catch {}
+}
+let adminProof = readStoredAdminProof();
 let adminTokenSession = false;
 
 function passkeysAvailableHere() {
@@ -111,9 +125,19 @@ function showAdminLogin() {
 }
 
 async function restoreAdminSession() {
-  const response = await fetch("/api/auth/session", { cache: "no-store" });
+  if (!adminProof) {
+    adminCsrf = "";
+    showAdminLogin();
+    return false;
+  }
+  const response = await fetch("/api/auth/session", {
+    cache: "no-store",
+    headers: { "X-LCP-Admin-Proof": adminProof },
+  });
   if (!response.ok) {
     adminCsrf = "";
+    adminProof = "";
+    clearStoredAdminProof();
     showAdminLogin();
     return false;
   }
@@ -127,11 +151,14 @@ async function restoreAdminSession() {
 async function api(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (adminProof) headers["X-LCP-Admin-Proof"] = adminProof;
   if (!["GET", "HEAD", "OPTIONS"].includes(method)) headers["X-LCP-Admin-CSRF"] = adminCsrf;
   const res = await fetch(path, { ...options, headers, credentials: "same-origin" });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) {
     adminCsrf = "";
+    adminProof = "";
+    clearStoredAdminProof();
     showAdminLogin();
   }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -157,11 +184,15 @@ document.getElementById("admin-login-form").addEventListener("submit", async (ev
       error.textContent = response.status === 429 ? "Too many attempts. Try again later." : "Invalid Admin credential.";
       return;
     }
+    const { proof } = await response.json();
+    if (typeof proof !== "string" || proof.length < 32) throw new Error("Missing origin session proof");
+    adminProof = proof;
+    storeAdminProof(proof);
     // Reload without retaining the token; the server cookie is HttpOnly.
     window.location.reload();
-  } catch {
+  } catch (err) {
     input.value = "";
-    error.textContent = "Could not contact the local Admin service.";
+    error.textContent = err?.message || "Could not contact the local Admin service.";
   } finally {
     button.disabled = false;
   }
@@ -172,6 +203,8 @@ document.getElementById("admin-logout").addEventListener("click", async () => {
     await api("/api/auth/logout", { method: "POST" });
   } finally {
     adminCsrf = "";
+    adminProof = "";
+    clearStoredAdminProof();
     window.location.reload();
   }
 });
@@ -195,6 +228,10 @@ document.getElementById("admin-passkey-login").addEventListener("click", async (
       headers: { "Content-Type": "application/json" }, body: JSON.stringify(credential),
     });
     if (!verification.ok) throw new Error("Passkey verification failed. Try again or use the Admin token.");
+    const { proof } = await verification.json();
+    if (typeof proof !== "string" || proof.length < 32) throw new Error("Missing origin session proof");
+    adminProof = proof;
+    storeAdminProof(proof);
     window.location.reload();
   } catch (err) {
     error.textContent = err?.name === "NotAllowedError"

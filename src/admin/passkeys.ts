@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type RequestHandler, type Response } from "express";
 import {
   generateAuthenticationOptions, generateRegistrationOptions,
@@ -14,6 +14,7 @@ const RP_ID = "localhost";
 const CHALLENGE_MS = 120_000;
 const MAX_PASSKEYS = 8;
 const MAX_PENDING = 64;
+const MAX_CONSUMED = 4096;
 const CHALLENGE_COOKIE = "lcp_admin_passkey_challenge";
 
 type StoredPasskey = {
@@ -63,6 +64,54 @@ function readStore(filePath: string): PasskeyFile {
   }
 }
 
+function lockRegistry(filePath: string): () => void {
+  // A second Admin process using the same registry could resurrect revoked
+  // credentials using a stale in-memory snapshot. Fail its startup closed.
+  const lockPath = filePath + ".lock";
+  const owner = JSON.stringify({ pid: process.pid, nonce: randomBytes(16).toString("hex") });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      try { fs.writeFileSync(fd, owner); } finally { fs.closeSync(fd); }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          if (fs.readFileSync(lockPath, "utf8") === owner) fs.unlinkSync(lockPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            // Shutdown must not crash because a private state file vanished.
+            console.error("Could not release the Admin passkey registry lock");
+          }
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stat = fs.lstatSync(lockPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 ||
+          stat.mtimeMs > Date.now() - 1000) {
+        throw new Error("Admin passkey registry is locked by another process");
+      }
+      let pid = 0;
+      try { pid = JSON.parse(fs.readFileSync(lockPath, "utf8")).pid; } catch {}
+      if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid Admin passkey lock");
+      try {
+        process.kill(pid, 0);
+        throw new Error("Admin passkey registry is already used by a running process");
+      } catch (probe) {
+        if ((probe as NodeJS.ErrnoException).code !== "ESRCH") {
+          throw new Error("Admin passkey registry is already used by a running process");
+        }
+      }
+      // Recover after a definite dead process. The 1s mtime guard prevents
+      // stealing a concurrently starting owner's not-yet-written lock.
+      fs.unlinkSync(lockPath);
+    }
+  }
+  throw new Error("Unable to acquire Admin passkey registry lock");
+}
+
 function readCookie(req: Request, name: string): string | undefined {
   const raw = req.headers.cookie;
   if (!raw || raw.length > 8192) return undefined;
@@ -79,7 +128,7 @@ function localhostOrigin(req: Request): string | undefined {
 export function createAdminPasskeyRouter(options: {
   protect: RequestHandler;
   getSession: (req: Request) => AdminSession | null;
-  issueSession: (res: Response, viaToken: boolean) => { csrf: string };
+  issueSession: (res: Response, viaToken: boolean) => { csrf: string; proof: string };
   invalidatePasskeySessions: () => void;
 }) {
   const router = Router();
@@ -87,9 +136,13 @@ export function createAdminPasskeyRouter(options: {
     path.join(os.homedir(), ".local", "lcp", "state", "admin-passkeys.json"));
   fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });
   let store = readStore(storePath);
+  const release = lockRegistry(storePath);
   let writeQueue = Promise.resolve();
   const enrol = new Map<string, Pending>();
-  const login = new Map<string, Pending>();
+  // Authentication issuance is stateless: malicious loopback clients cannot
+  // evict another user's pending challenge by allocating many new ones.
+  const challengeSigningKey = randomBytes(32);
+  const usedChallenges = new Map<string, number>();
 
   async function mutate(fn: (copy: PasskeyFile) => void): Promise<void> {
     const op = writeQueue.then(async () => {
@@ -106,6 +159,31 @@ export function createAdminPasskeyRouter(options: {
     const now = Date.now();
     for (const [key, item] of map) if (item.expires <= now) map.delete(key);
     while (map.size >= MAX_PENDING) map.delete(map.keys().next().value!);
+  }
+
+  function signChallenge(payload: string): string {
+    return createHmac("sha256", challengeSigningKey).update(payload).digest("base64url");
+  }
+
+  function consumeChallenge(cookie: string | undefined): string | undefined {
+    if (!cookie || cookie.length > 512) return undefined;
+    const segments = cookie.split(".");
+    if (segments.length !== 4) return undefined;
+    const [deadline, nonce, challenge, signature] = segments;
+    if (!/^[a-z0-9]{1,12}$/.test(deadline) ||
+        !/^[a-f0-9]{32}$/.test(nonce) ||
+        !/^[A-Za-z0-9_-]{32,128}$/.test(challenge) ||
+        !/^[A-Za-z0-9_-]{43}$/.test(signature)) return undefined;
+    const expires = Number.parseInt(deadline, 36);
+    if (!Number.isSafeInteger(expires) || expires <= Date.now() ||
+        expires > Date.now() + CHALLENGE_MS) return undefined;
+    const expected = Buffer.from(signChallenge(`${deadline}.${nonce}.${challenge}`), "base64url");
+    const provided = Buffer.from(signature, "base64url");
+    if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) return undefined;
+    for (const [id, when] of usedChallenges) if (when <= Date.now()) usedChallenges.delete(id);
+    if (usedChallenges.has(nonce) || usedChallenges.size >= MAX_CONSUMED) return undefined;
+    usedChallenges.set(nonce, expires); // Single-use, including a failed proof.
+    return challenge;
   }
 
   function tokenSession(req: Request, res: Response): AdminSession | null {
@@ -204,21 +282,18 @@ export function createAdminPasskeyRouter(options: {
       userVerification: "required",
       allowCredentials: store.credentials.map(({ id, transports }) => ({ id, transports })),
     });
-    prune(login);
-    const id = randomBytes(32).toString("hex");
-    login.set(id, { challenge: authOptions.challenge, expires: Date.now() + CHALLENGE_MS });
-    res.setHeader("Set-Cookie", `${CHALLENGE_COOKIE}=${id}; Path=/api/auth/passkeys; HttpOnly; SameSite=Strict; Max-Age=120`);
+    const payload = `${(Date.now() + CHALLENGE_MS).toString(36)}.${randomBytes(16).toString("hex")}.${authOptions.challenge}`;
+    const token = `${payload}.${signChallenge(payload)}`;
+    res.setHeader("Set-Cookie", `${CHALLENGE_COOKIE}=${token}; Path=/api/auth/passkeys; HttpOnly; SameSite=Strict; Max-Age=120`);
     res.json({ ok: true, options: authOptions });
   });
 
   router.post("/authentication/verify", async (req, res) => {
     const origin = requireLocalhost(req, res);
     if (!origin) return;
-    const id = readCookie(req, CHALLENGE_COOKIE);
-    const pending = id ? login.get(id) : undefined;
-    if (id) login.delete(id); // Never allow replay of the challenge.
+    const challenge = consumeChallenge(readCookie(req, CHALLENGE_COOKIE));
     res.setHeader("Set-Cookie", `${CHALLENGE_COOKIE}=; Path=/api/auth/passkeys; HttpOnly; SameSite=Strict; Max-Age=0`);
-    if (!pending || pending.expires <= Date.now()) {
+    if (!challenge) {
       res.status(400).json({ ok: false, error: "Passkey login challenge expired" });
       return;
     }
@@ -235,7 +310,7 @@ export function createAdminPasskeyRouter(options: {
     try {
       const verified = await verifyAuthenticationResponse({
         response,
-        expectedChallenge: pending.challenge,
+        expectedChallenge: challenge,
         expectedOrigin: origin,
         expectedRPID: RP_ID,
         requireUserVerification: true,
@@ -253,7 +328,7 @@ export function createAdminPasskeyRouter(options: {
         current.counter = verified.authenticationInfo.newCounter;
       });
       const session = options.issueSession(res, false);
-      res.json({ ok: true, authenticated: true, csrf: session.csrf });
+      res.json({ ok: true, authenticated: true, csrf: session.csrf, proof: session.proof });
     } catch {
       res.status(401).json({ ok: false, error: "Passkey authentication failed" });
     }
@@ -284,5 +359,5 @@ export function createAdminPasskeyRouter(options: {
     res.json({ ok: true, remaining: store.credentials.length });
   });
 
-  return router;
+  return { router, release };
 }
