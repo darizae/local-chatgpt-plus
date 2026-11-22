@@ -45,7 +45,7 @@ jobs:
       - name: Prepare isolated regression permission policy
         run: |
           mkdir -p "$RUNNER_TEMP/lcp-ci"
-          printf '{"version":1,"profile":"open"}\\n' > "$RUNNER_TEMP/lcp-ci/permissions.json"
+          echo '{"version":1,"profile":"open"}' > "$RUNNER_TEMP/lcp-ci/permissions.json"
 
       - name: Unit/regression suite
         env:
