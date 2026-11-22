@@ -74,6 +74,50 @@ function toast(msg, isError = false) {
 }
 
 let adminCsrf = "";
+// Never trust the localhost session cookie alone: cookies cross ports, while
+// sessionStorage is isolated by origin (including the Admin port).
+const ADMIN_PROOF_STORAGE_KEY = "lcp-admin-origin-proof";
+function readStoredAdminProof() {
+  try { return sessionStorage.getItem(ADMIN_PROOF_STORAGE_KEY) || ""; } catch { return ""; }
+}
+function storeAdminProof(proof) {
+  try { sessionStorage.setItem(ADMIN_PROOF_STORAGE_KEY, proof); }
+  catch { throw new Error("Browser session storage is required for secure Admin login."); }
+}
+function clearStoredAdminProof() {
+  try { sessionStorage.removeItem(ADMIN_PROOF_STORAGE_KEY); } catch {}
+}
+let adminProof = readStoredAdminProof();
+let adminTokenSession = false;
+
+function passkeysAvailableHere() {
+  return location.hostname === "localhost" && window.isSecureContext &&
+    Boolean(window.SimpleWebAuthnBrowser?.browserSupportsWebAuthn?.());
+}
+
+async function refreshAdminPasskeys() {
+  const enabled = passkeysAvailableHere();
+  const note = document.getElementById("admin-passkey-note");
+  const signIn = document.getElementById("admin-passkey-login");
+  document.getElementById("admin-add-passkey").hidden = !(enabled && adminTokenSession);
+  document.getElementById("admin-manage-passkeys").hidden = !(enabled && adminTokenSession);
+  if (!enabled) {
+    const home = `http://localhost:${location.port}/ui/`;
+    note.textContent = location.hostname === "localhost"
+      ? "This browser does not support WebAuthn passkeys; use the Admin token."
+      : `Passkeys are available from ${home}. Your Admin token still works here.`;
+    signIn.hidden = true;
+    return;
+  }
+  note.textContent = "Passkeys are saved by your browser's credential provider (Apple Passwords on macOS).";
+  try {
+    const response = await fetch("/api/auth/passkeys/status", { cache: "no-store" });
+    const info = await response.json();
+    signIn.hidden = !info.registered;
+  } catch {
+    signIn.hidden = true;
+  }
+}
 
 function showAdminLogin() {
   const dialog = document.getElementById("admin-login");
@@ -81,25 +125,40 @@ function showAdminLogin() {
 }
 
 async function restoreAdminSession() {
-  const response = await fetch("/api/auth/session", { cache: "no-store" });
+  if (!adminProof) {
+    adminCsrf = "";
+    showAdminLogin();
+    return false;
+  }
+  const response = await fetch("/api/auth/session", {
+    cache: "no-store",
+    headers: { "X-LCP-Admin-Proof": adminProof },
+  });
   if (!response.ok) {
     adminCsrf = "";
+    adminProof = "";
+    clearStoredAdminProof();
     showAdminLogin();
     return false;
   }
   const session = await response.json();
   adminCsrf = session.csrf || "";
+  adminTokenSession = Boolean(session.viaToken);
+  await refreshAdminPasskeys();
   return Boolean(adminCsrf);
 }
 
 async function api(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (adminProof) headers["X-LCP-Admin-Proof"] = adminProof;
   if (!["GET", "HEAD", "OPTIONS"].includes(method)) headers["X-LCP-Admin-CSRF"] = adminCsrf;
   const res = await fetch(path, { ...options, headers, credentials: "same-origin" });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) {
     adminCsrf = "";
+    adminProof = "";
+    clearStoredAdminProof();
     showAdminLogin();
   }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -125,11 +184,15 @@ document.getElementById("admin-login-form").addEventListener("submit", async (ev
       error.textContent = response.status === 429 ? "Too many attempts. Try again later." : "Invalid Admin credential.";
       return;
     }
+    const { proof } = await response.json();
+    if (typeof proof !== "string" || proof.length < 32) throw new Error("Missing origin session proof");
+    adminProof = proof;
+    storeAdminProof(proof);
     // Reload without retaining the token; the server cookie is HttpOnly.
     window.location.reload();
-  } catch {
+  } catch (err) {
     input.value = "";
-    error.textContent = "Could not contact the local Admin service.";
+    error.textContent = err?.message || "Could not contact the local Admin service.";
   } finally {
     button.disabled = false;
   }
@@ -140,9 +203,111 @@ document.getElementById("admin-logout").addEventListener("click", async () => {
     await api("/api/auth/logout", { method: "POST" });
   } finally {
     adminCsrf = "";
+    adminProof = "";
+    clearStoredAdminProof();
     window.location.reload();
   }
 });
+
+document.getElementById("admin-passkey-login").addEventListener("click", async () => {
+  const button = document.getElementById("admin-passkey-login");
+  const error = document.getElementById("admin-login-error");
+  button.disabled = true;
+  error.textContent = "";
+  try {
+    if (!passkeysAvailableHere()) throw new Error("Use localhost in a browser with passkey support.");
+    const optionsResult = await fetch("/api/auth/passkeys/authentication/options", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!optionsResult.ok) throw new Error("Could not start passkey authentication.");
+    const { options } = await optionsResult.json();
+    const credential = await window.SimpleWebAuthnBrowser.startAuthentication({ optionsJSON: options });
+    const verification = await fetch("/api/auth/passkeys/authentication/verify", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(credential),
+    });
+    if (!verification.ok) throw new Error("Passkey verification failed. Try again or use the Admin token.");
+    const { proof } = await verification.json();
+    if (typeof proof !== "string" || proof.length < 32) throw new Error("Missing origin session proof");
+    adminProof = proof;
+    storeAdminProof(proof);
+    window.location.reload();
+  } catch (err) {
+    error.textContent = err?.name === "NotAllowedError"
+      ? "Passkey prompt cancelled."
+      : (err?.message || "Passkey login failed.");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.getElementById("admin-add-passkey").addEventListener("click", async () => {
+  const button = document.getElementById("admin-add-passkey");
+  button.disabled = true;
+  try {
+    if (!passkeysAvailableHere() || !adminTokenSession) throw new Error("Sign in with your Admin token on localhost first.");
+    const { options } = await api("/api/auth/passkeys/registration/options", { method: "POST" });
+    const credential = await window.SimpleWebAuthnBrowser.startRegistration({ optionsJSON: options });
+    await api("/api/auth/passkeys/registration/verify", {
+      method: "POST", body: JSON.stringify(credential),
+    });
+    toast("Passkey registered. You can now use Touch ID or your device passcode to sign in.");
+    await refreshAdminPasskeys();
+  } catch (err) {
+    toast(err?.name === "NotAllowedError" ? "Passkey enrollment cancelled." : (err?.message || "Passkey enrollment failed."), true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.getElementById("admin-passkeys-close").addEventListener("click", () => {
+  document.getElementById("admin-passkeys-dialog").close();
+});
+
+document.getElementById("admin-manage-passkeys").addEventListener("click", async () => {
+  try {
+    const response = await api("/api/auth/passkeys/registered");
+    if (!response.canManage) throw new Error("Sign in using the Admin token to manage passkeys.");
+    const list = document.getElementById("admin-passkey-list");
+    list.replaceChildren();
+    for (const item of response.credentials) {
+      const row = document.createElement("div");
+      row.className = "inline-form";
+      const label = document.createElement("span");
+      label.textContent = `Passkey registered ${new Date(item.createdAt).toLocaleString()} (${item.id.slice(0, 8)}…)`;
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "btn ghost";
+      revoke.textContent = "Remove";
+      revoke.addEventListener("click", async () => {
+        if (!window.confirm("Remove this passkey from the Admin server? It will no longer authenticate here.")) return;
+        try {
+          await api("/api/auth/passkeys/revoke", {
+            method: "POST", body: JSON.stringify({ id: item.id }),
+          });
+          row.remove();
+          await refreshAdminPasskeys();
+          toast("Passkey revoked on the server.");
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
+      row.append(label, revoke);
+      list.append(row);
+    }
+    if (!response.credentials.length) {
+      const note = document.createElement("p");
+      note.textContent = "No passkeys registered yet. Use Add passkey.";
+      list.append(note);
+    }
+    document.getElementById("admin-passkeys-dialog").showModal();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+void refreshAdminPasskeys();
 
 function badge(health) {
   if (health === "connected") return '<span class="badge ok">connected</span>';

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type RequestHandler, type Response } from "express";
+import { createAdminPasskeyRouter } from "./passkeys.js";
 
 /**
  * Admin authentication is deliberately distinct from MCP OAuth.
@@ -15,7 +16,7 @@ const MAX_SESSIONS = 64;
 const MAX_FAILED_LOGINS = 8;
 const FAILURE_WINDOW_MS = 60_000;
 
-type Session = { csrf: string; expires: number; tokenDigest: string };
+type Session = { csrf: string; proof: string; expires: number; tokenDigest: string; viaToken: boolean };
 
 function hash(text: string): Buffer {
   return createHash("sha256").update(text).digest();
@@ -53,7 +54,7 @@ export function createAdminSessionAuth() {
   const loginFailures = new Map<string, { attempts: number; resetAt: number }>();
   const router = Router();
 
-  function currentSession(req: Request): Session | null {
+  function currentSession(req: Request): (Session & { id: string }) | null {
     const id = parseCookie(req);
     if (!id) return null;
     const session = sessions.get(id);
@@ -63,7 +64,34 @@ export function createAdminSessionAuth() {
       sessions.delete(id);
       return null;
     }
-    return session;
+    return { ...session, id };
+  }
+
+  function issueSession(res: Response, viaToken: boolean): { csrf: string; proof: string } {
+    const now = Date.now();
+    for (const [id, session] of sessions) {
+      if (session.expires <= now) sessions.delete(id);
+    }
+    while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value!);
+    const id = randomBytes(32).toString("hex");
+    const csrf = randomBytes(32).toString("hex");
+    // Cookies are scoped to hostname but NOT to TCP port: another localhost
+    // service can receive the cookie. Require a second secret available only
+    // to scripts in the Admin page's *origin*-scoped sessionStorage.
+    const proof = randomBytes(32).toString("hex");
+    sessions.set(id, {
+      csrf, proof, expires: now + SESSION_TTL_MS,
+      tokenDigest: tokenDigest(process.env.ADMIN_TOKEN!.trim()), viaToken,
+    });
+    const cookie = `${COOKIE_NAME}=${id}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_MS / 1000}`;
+    const existing = res.getHeader("Set-Cookie");
+    res.setHeader("Set-Cookie", existing ? [cookie, ...(Array.isArray(existing) ? existing.map(String) : [String(existing)])] : cookie);
+    return { csrf, proof };
+  }
+
+  function hasOriginProof(req: Request, session: Session): boolean {
+    const supplied = req.headers["x-lcp-admin-proof"];
+    return typeof supplied === "string" && equalTokens(session.proof, supplied);
   }
 
   const protect: RequestHandler = (req, res, next) => {
@@ -80,7 +108,7 @@ export function createAdminSessionAuth() {
     }
 
     const session = currentSession(req);
-    if (!session) {
+    if (!session || !hasOriginProof(req, session)) {
       res.status(401).json({ ok: false, error: "Admin authentication required" });
       return;
     }
@@ -114,31 +142,25 @@ export function createAdminSessionAuth() {
       return;
     }
     loginFailures.delete(address);
-    for (const [id, session] of sessions) {
-      if (session.expires <= now) sessions.delete(id);
-    }
-    while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value!);
-    const id = randomBytes(32).toString("hex");
-    const csrf = randomBytes(32).toString("hex");
-    sessions.set(id, { csrf, expires: now + SESSION_TTL_MS, tokenDigest: tokenDigest(process.env.ADMIN_TOKEN!.trim()) });
-    res.setHeader("Set-Cookie", `${COOKIE_NAME}=${id}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_MS / 1000}`);
-    res.json({ ok: true, authenticated: true, csrf });
+    const { csrf, proof } = issueSession(res, true);
+    res.json({ ok: true, authenticated: true, csrf, proof });
   });
 
   router.get("/session", (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     const session = currentSession(req);
-    if (!session) {
+    if (!session || !hasOriginProof(req, session)) {
       res.status(401).json({ ok: false, authenticated: false });
       return;
     }
-    res.json({ ok: true, authenticated: true, csrf: session.csrf });
+    res.json({ ok: true, authenticated: true, csrf: session.csrf, viaToken: session.viaToken });
   });
 
   router.post("/logout", (req, res) => {
     const session = currentSession(req);
     const supplied = req.headers["x-lcp-admin-csrf"];
-    if (!session || typeof supplied !== "string" || !equalTokens(session.csrf, supplied)) {
+    if (!session || !hasOriginProof(req, session) ||
+        typeof supplied !== "string" || !equalTokens(session.csrf, supplied)) {
       res.status(403).json({ ok: false, error: "Invalid Admin session" });
       return;
     }
@@ -148,5 +170,15 @@ export function createAdminSessionAuth() {
     res.json({ ok: true });
   });
 
-  return { router, protect };
+  const passkeys = createAdminPasskeyRouter({
+    protect,
+    getSession: currentSession,
+    issueSession,
+    invalidatePasskeySessions: () => {
+      for (const [id, session] of sessions) if (!session.viaToken) sessions.delete(id);
+    },
+  });
+  router.use("/passkeys", passkeys.router);
+
+  return { router, protect, release: passkeys.release };
 }

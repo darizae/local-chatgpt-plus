@@ -14,7 +14,11 @@
       <p class="muted">Enter your local ADMIN_TOKEN. It is exchanged for an HttpOnly session cookie and is not stored by this page.</p>
       <label class="field"><span>Admin token</span><input id="admin-login-token" type="password" required autocomplete="off" spellcheck="false" /></label>
       <p id="admin-login-error" class="muted" role="alert"></p>
-      <menu class="modal-foot"><button id="admin-login-submit" class="btn primary" type="submit">Unlock</button></menu>
+      <menu class="modal-foot">
+        <button id="admin-passkey-login" class="btn ghost" type="button" hidden>Sign in with passkey</button>
+        <button id="admin-login-submit" class="btn primary" type="submit">Unlock with token</button>
+      </menu>
+      <p id="admin-passkey-note" class="muted"></p>
     </form>
   </dialog>
   <div class="layout">
@@ -45,6 +49,8 @@
         <h1 id="page-title">Overview</h1>
         <div class="topbar-actions">
           <button type="button" class="btn ghost" id="refresh-all">Refresh</button>
+          <button type="button" class="btn ghost" id="admin-add-passkey" hidden>Add passkey</button>
+          <button type="button" class="btn ghost" id="admin-manage-passkeys" hidden>Manage passkeys</button>
           <button type="button" class="btn ghost" id="admin-logout">Sign out</button>
         </div>
       </header>
@@ -334,6 +340,18 @@
     </div>
   </dialog>
 
+  <dialog id="admin-passkeys-dialog" class="modal">
+    <div class="modal-body">
+      <div class="modal-head"><h3>Registered Admin passkeys</h3>
+        <button type="button" class="btn ghost" id="admin-passkeys-close">Close</button>
+      </div>
+      <p class="muted">Manage credentials from a session opened with your Admin recovery token.
+        Removing a passkey here prevents future login, but does not erase it from Apple Passwords.</p>
+      <div id="admin-passkey-list"></div>
+    </div>
+  </dialog>
+
+  <script src="/ui/passkeys-vendor.js"></script>
   <script src="action-glossary.js"></script>
   <script src="app.js"></script>
 </body>

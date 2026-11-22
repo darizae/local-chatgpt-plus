@@ -76,6 +76,11 @@ export function startAdminServer(options: AdminServerOptions): Server {
   // The login page must load before a cookie exists. It contains no runtime
   // data; the protected API and SSE stream are guarded below.
   const uiDir = path.resolve(__dirname, "../../public/ui");
+  // Serve a pinned, locally installed WebAuthn browser bundle. No external
+  // CDN is permitted by Admin's CSP or required during login.
+  app.get("/ui/passkeys-vendor.js", (_req, res) => {
+    res.sendFile(path.resolve(__dirname, "../../node_modules/@simplewebauthn/browser/dist/bundle/index.umd.min.js"));
+  });
   app.use("/ui", express.static(uiDir));
   app.use("/api/auth", adminSecurity.router);
   app.use(adminSecurity.protect);
@@ -96,8 +101,14 @@ export function startAdminServer(options: AdminServerOptions): Server {
     instructionsPreview: options.instructionsPreview,
   }));
 
-  return app.listen(options.port, host, () => {
+  const server = app.listen(options.port, host, () => {
     console.log(`  Admin UI:  http://${host}:${options.port}/ui`);
     console.log(`  Admin API: http://${host}:${options.port}/health`);
   });
+  process.once("exit", adminSecurity.release);
+  server.once("close", () => {
+    process.removeListener("exit", adminSecurity.release);
+    adminSecurity.release();
+  });
+  return server;
 }
