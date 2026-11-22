@@ -11,6 +11,12 @@ const oldDirs = process.env.LOCAL_CODER_SKILL_DIRS;
 const oldPermissions = process.env.PERMISSIONS_CONFIG;
 const oldGlobalSkillControls = process.env.LOCAL_CODER_GLOBAL_SKILLS_CONFIG;
 try {
+  // The first discovery assertions deliberately exercise the unrestricted
+  // profile. CI must not depend on whether a maintainer has a gitignored
+  // permissions.json or on the fresh-install workspace fallback.
+  const initialPermissions = path.join(temporary, "baseline-permissions.json");
+  await fs.writeFile(initialPermissions, JSON.stringify({ version: 1, profile: "open" }));
+  process.env.PERMISSIONS_CONFIG = initialPermissions;
   process.env.LOCAL_CODER_GLOBAL_SKILLS_CONFIG = path.join(temporary, "global-controls.json");
   const project = path.join(temporary, "project");
   const extra = path.join(temporary, "extra");
