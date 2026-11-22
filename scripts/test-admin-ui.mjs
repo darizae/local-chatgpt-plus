@@ -33,6 +33,17 @@ test("Admin UI JavaScript parses", () => {
   new Function(js);
 });
 
+test("Activity stream reconnects after wake and transient failures", () => {
+  for (const expected of [
+    "function scheduleActivityReconnect()", "activityReconnectAttempt", "startActivityStream({ restart: true })",
+    'document.addEventListener("visibilitychange"', 'window.addEventListener("online"',
+    'window.addEventListener("pageshow"', "activityEventSource !== source", "loadActivity().catch(() => {})",
+    "AbortSignal.timeout(10000)", "Admin session expired — sign in to reconnect.",
+  ]) {
+    if (!js.includes(expected)) throw new Error(`Activity recovery missing: ${expected}`);
+  }
+});
+
 test("action-glossary.js loads before app.js", () => {
   const glIdx = html.indexOf("action-glossary.js");
   const appIdx = html.indexOf("app.js");

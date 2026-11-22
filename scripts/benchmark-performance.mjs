@@ -135,6 +135,7 @@ async function bootServer({ profile, admin, tui, fixture }) {
     NODE_ENV: "test",
     LCP_ALLOW_UNAUTHENTICATED_TEST_ONLY: "1",
       ADMIN_TOKEN: "lcp-test-admin-synthetic-only",
+      ADMIN_PASSKEY_FILE: path.join(fixture, "admin-passkeys.json"),
       INBOUND_AUTH_MODE: "token",
       LOCAL_CODER_TUI: tui ? "on" : "off",
       LOCAL_CODER_ADMIN_ENABLED: admin ? "true" : "false",

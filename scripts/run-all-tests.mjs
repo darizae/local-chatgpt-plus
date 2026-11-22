@@ -58,6 +58,7 @@ const isolatedEnv = {
     NODE_ENV: "test",
     LCP_ALLOW_UNAUTHENTICATED_TEST_ONLY: "1",
   ADMIN_TOKEN: "lcp-test-admin-synthetic-only",
+  ADMIN_PASSKEY_FILE: path.join(scratch, "admin-passkeys.json"),
     LOCAL_CODER_ADMIN_ENABLED: "true",
   LOCAL_CODER_TUI: "off",
   CHATGPT_TOOL_PROFILE: "slim",

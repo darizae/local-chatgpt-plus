@@ -104,6 +104,7 @@ async function startServer() {
     NODE_ENV: "test",
     LCP_ALLOW_UNAUTHENTICATED_TEST_ONLY: "1",
     ADMIN_TOKEN: "lcp-test-admin-synthetic-only",
+    ADMIN_PASSKEY_FILE: path.join(stateRoot, "admin-passkeys.json"),
     LOCAL_CODER_ADMIN_ENABLED: "true",
     INBOUND_AUTH_MODE: "token",
     LOCAL_CODER_TUI: "off",
