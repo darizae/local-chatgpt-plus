@@ -23,7 +23,7 @@ npm ci
 npm start
 ```
 
-The local MCP server defaults to `http://127.0.0.1:3000`; check `http://127.0.0.1:3000/health`. The optional **Admin UI** uses `http://127.0.0.1:3001/ui` when enabled, and now **requires a locally generated `ADMIN_TOKEN`**. Browser access uses a same-site login/session cookie plus a CSRF token; authenticated local automation may use a Bearer header. The new-install defaults disable Admin and ChatGPT auto-approval. Enabling Admin also enables its settings and upstream OAuth callback endpoints. Never tunnel Admin. The terminal dashboard starts automatically in an interactive terminal; set `LOCAL_CODER_TUI=off` for normal logs.
+The local MCP server defaults to `http://127.0.0.1:3000`; check `http://127.0.0.1:3000/health`. The optional **Admin UI** is available at `http://localhost:3001/ui/` when enabled and **requires a locally generated `ADMIN_TOKEN`** for bootstrapping and recovery. On macOS, you can also enroll a [Touch ID / Apple Passwords passkey](docs/ADMIN_PASSKEYS.md) for routine Admin login. Passkeys are bound to `localhost` (not numeric `127.0.0.1`); the Admin server still binds to loopback. Browser access uses an HttpOnly same-site session cookie plus CSRF; local automation may use a Bearer token. The new-install defaults disable Admin and ChatGPT auto-approval. Enabling Admin also enables its settings and upstream OAuth callback endpoints. Never tunnel Admin. The terminal dashboard starts automatically in an interactive terminal; set `LOCAL_CODER_TUI=off` for normal logs.
 
 **Security:** Set `MCP_TOKEN` before exposing port 3000 through a tunnel. The default `workspace` permission profile narrows direct path parameters, but shell commands still run with the user's OS privileges; `WORKSPACE_PATH` changes the default directory but is **not a sandbox**. Never tunnel the Admin port, and keep the tokenized MCP URL secret. See [Security details](docs/OPERATIONS.md#security-details).
 
@@ -202,7 +202,7 @@ being reachable when the server is OFF. To watch live agent activity:
    opens the Admin dashboard automatically once the Admin UI is ready (disable
    with `LCP_OPEN_DASHBOARD=0`; headless/daemon/`lcp restart|mode|toggle` never
    auto-open, so nothing steals focus).
-2. Open `http://127.0.0.1:3001/ui`.
+2. Open `http://localhost:3001/ui/`. Sign in with your private Admin recovery token, or [enroll/use an Apple Passwords passkey](docs/ADMIN_PASSKEYS.md) for future sign-ins.
 3. Open the **Activity** tab and keep **Live** enabled.
 4. Make a tool call from ChatGPT — it appears in the feed with a friendly
    description, status, duration, and sanitized expandable details, and any

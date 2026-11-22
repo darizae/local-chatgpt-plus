@@ -8,11 +8,13 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const cwd = process.cwd();
 const oldAdmin = process.env.ADMIN_TOKEN;
+const oldPasskeyFile = process.env.ADMIN_PASSKEY_FILE;
 const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "lcp-admin-harden-"));
 const canary = "SYNTHETIC-CREDENTIAL-NOT-REAL-abc0123456789";
 const realToken = "SYNTHETIC-ADMIN-TEST-TOKEN-" + "a".repeat(48);
 
 try {
+  process.env.ADMIN_PASSKEY_FILE = path.join(scratch, "admin-passkeys.json");
   process.chdir(scratch);
   const { startAdminServer } = await import("../dist/admin/server.js");
   delete process.env.ADMIN_TOKEN;
@@ -134,6 +136,8 @@ try {
 } finally {
   if (oldAdmin === undefined) delete process.env.ADMIN_TOKEN;
   else process.env.ADMIN_TOKEN = oldAdmin;
+  if (oldPasskeyFile === undefined) delete process.env.ADMIN_PASSKEY_FILE;
+  else process.env.ADMIN_PASSKEY_FILE = oldPasskeyFile;
   process.chdir(cwd);
   await fs.rm(scratch, { recursive: true, force: true });
 }
