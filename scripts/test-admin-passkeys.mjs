@@ -217,8 +217,12 @@ try {
     clientExtensionResults: {},
   };
 
-  const tamperedChallengeCookie = challengeCookie.slice(0, -1) +
-    (challengeCookie.endsWith("a") ? "b" : "a");
+  // Change high-order signature bits; altering a base64url tail character
+  // can leave decoded bytes unchanged because of unused padding bits.
+  const cookieValueStart = challengeCookie.indexOf("=") + 1;
+  const tamperedParts = challengeCookie.slice(cookieValueStart).split(".");
+  tamperedParts[3] = (tamperedParts[3][0] === "A" ? "B" : "A") + tamperedParts[3].slice(1);
+  const tamperedChallengeCookie = challengeCookie.slice(0, cookieValueStart) + tamperedParts.join(".");
   assert.equal((await request(prefix + "/authentication/verify", {
     method: "POST", cookie: tamperedChallengeCookie, body: authentication,
   })).response.status, 400, "a tampered signed challenge cookie must be rejected");
