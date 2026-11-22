@@ -25,6 +25,12 @@ Steps, in order:
 8. `node scripts/check-publication-content.mjs` — tracked-HEAD credential
    pattern tripwire.
 
+The **unit/regression** step alone creates an ephemeral `open` permission
+profile in the runner's temporary directory. Several tests intentionally
+exercise filesystem access outside the checkout and unsafe runtime features;
+this fixture is not a deployment setting. Dedicated secure-default tests still
+remove the override and assert the fresh-checkout `workspace` policy.
+
 The `timeout-minutes` bound and the self-contained test scripts (loopback
 fixtures, mock transports, random local ports) keep the job deterministic and
 non-flaky. No live tunnel, IdP, OAuth consent, or deployment is exercised.

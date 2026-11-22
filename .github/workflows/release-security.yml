@@ -39,7 +39,17 @@ jobs:
       - name: Smoke security check
         run: npm run test:smoke
 
+      # A few regression fixtures intentionally run commands outside the
+      # checkout and test unsafe runtimes. The default production policy still
+      # falls back to workspace; only this disposable CI job opts into open.
+      - name: Prepare isolated regression permission policy
+        run: |
+          mkdir -p "$RUNNER_TEMP/lcp-ci"
+          printf '{"version":1,"profile":"open"}\\n' > "$RUNNER_TEMP/lcp-ci/permissions.json"
+
       - name: Unit/regression suite
+        env:
+          PERMISSIONS_CONFIG: ${{ runner.temp }}/lcp-ci/permissions.json
         run: npm test
 
       - name: Integration suite
