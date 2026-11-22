@@ -55,6 +55,10 @@ let upstreamConfig = { servers: [] };
 let editingServerId = null;
 let activityPollTimer = null;
 let activityEventSource = null;
+let activityReconnectTimer = null;
+let activityReconnectAttempt = 0;
+let activityContextRefreshing = false;
+let activityContextLastTick = Date.now();
 let activitySeenIds = new Set();
 let activityPaused = false;
 let dashboardRuntimeTimer = null;
@@ -161,7 +165,11 @@ async function api(path, options = {}) {
     clearStoredAdminProof();
     showAdminLogin();
   }
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(data.error || `HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -1308,31 +1316,63 @@ async function loadActivity({ reset = false } = {}) {
   mergeActivityEntries(entries, { prepend: true });
 }
 
+function activityTabVisible() {
+  return !document.hidden && Boolean(document.getElementById("activity")?.classList.contains("active"));
+}
+
+function activityStreamWanted() {
+  return activityTabVisible() && document.getElementById("activity-live").checked &&
+    !activityPaused && !document.getElementById("admin-login")?.open;
+}
+
 function stopActivityStream() {
   if (activityPollTimer) {
     clearInterval(activityPollTimer);
     activityPollTimer = null;
   }
+  if (activityReconnectTimer) {
+    clearTimeout(activityReconnectTimer);
+    activityReconnectTimer = null;
+  }
+  activityReconnectAttempt = 0;
   if (activityEventSource) {
     activityEventSource.close();
     activityEventSource = null;
   }
 }
 
-function startActivityStream() {
-  stopActivityStream();
-  const live = document.getElementById("activity-live").checked;
-  if (!live || activityPaused) return;
+function scheduleActivityReconnect() {
+  if (activityReconnectTimer || !activityStreamWanted()) return;
+  const delay = Math.min(30000, 2000 * (2 ** Math.min(activityReconnectAttempt++, 4)));
+  activityReconnectTimer = setTimeout(() => {
+    activityReconnectTimer = null;
+    startActivityStream();
+  }, delay);
+}
 
-  activityEventSource = new EventSource("/api/activity/stream");
-  activityEventSource.onopen = () => {
+function startActivityStream({ restart = false } = {}) {
+  if (!activityStreamWanted()) return;
+  if (activityEventSource && !restart) return;
+  activityEventSource?.close();
+  if (activityReconnectTimer) {
+    clearTimeout(activityReconnectTimer);
+    activityReconnectTimer = null;
+  }
+  const source = new EventSource("/api/activity/stream");
+  activityEventSource = source;
+  source.onopen = () => {
+    if (activityEventSource !== source) return;
+    activityReconnectAttempt = 0;
     renderActivityLiveState(null);
     if (activityPollTimer) {
       clearInterval(activityPollTimer);
       activityPollTimer = null;
     }
+    // Backfill activity missed while the browser or laptop was asleep.
+    loadActivity().catch(() => {});
   };
-  activityEventSource.onmessage = (ev) => {
+  source.onmessage = (ev) => {
+    if (activityEventSource !== source) return;
     try {
       const entry = JSON.parse(ev.data);
       const kind = document.getElementById("activity-kind").value;
@@ -1347,24 +1387,46 @@ function startActivityStream() {
       mergeActivityEntries([entry], { prepend: true });
     } catch {}
   };
-  activityEventSource.onerror = () => {
-    activityEventSource?.close();
+  source.onerror = () => {
+    if (activityEventSource !== source) return;
+    source.close();
     activityEventSource = null;
+    if (!activityStreamWanted()) return;
     if (!activityPollTimer) {
-      activityPollTimer = setInterval(() => loadActivity().catch(() => {}), 2000);
+      activityPollTimer = setInterval(() => {
+        if (activityTabVisible()) loadActivity().catch(() => {});
+      }, 2000);
     }
-    renderActivityLiveState("off", "Live updates disconnected — attempting to reconnect via polling.");
+    scheduleActivityReconnect();
+    renderActivityLiveState("off", "Live stream disconnected — polling while reconnecting…");
   };
 }
 
 async function refreshActivityContext() {
+  if (activityContextRefreshing) return;
+  activityContextRefreshing = true;
   try {
-    const [health, runtimeInfo] = await Promise.all([api("/health"), api("/api/runtime")]);
+    const signal = AbortSignal.timeout(10000);
+    const [health, runtimeInfo] = await Promise.all([
+      api("/health", { signal }), api("/api/runtime", { signal }),
+    ]);
+    if (!activityTabVisible()) return;
     renderActivityStatusBar(runtimeInfo, health);
     renderActivityRunning(runtimeInfo.runtime || {});
     dashboardHealthCache = health;
-  } catch {
-    renderActivityLiveState("off", "Connection to the Admin API lost — retrying…");
+    if (!activityStreamWanted() || activityEventSource?.readyState === EventSource.OPEN) {
+      renderActivityLiveState(null);
+    } else if (activityPollTimer) {
+      renderActivityLiveState("off", "Live stream disconnected — polling while reconnecting…");
+    }
+  } catch (error) {
+    if (activityTabVisible()) {
+      renderActivityLiveState("off", error.status === 401
+        ? "Admin session expired — sign in to reconnect."
+        : "Connection to the Admin API lost — retrying…");
+    }
+  } finally {
+    activityContextRefreshing = false;
   }
 }
 
@@ -1374,8 +1436,13 @@ function stopActivityContextLoop() {
 }
 function startActivityContextLoop() {
   if (activityContextTimer) return;
+  activityContextLastTick = Date.now();
   activityContextTimer = setInterval(() => {
-    if (document.hidden || !document.getElementById("activity")?.classList.contains("active")) return;
+    const now = Date.now();
+    const wokeFromSleep = now - activityContextLastTick > 15000;
+    activityContextLastTick = now;
+    if (!activityTabVisible()) return;
+    if (wokeFromSleep) return resumeAdminUiAfterWake();
     refreshActivityContext().catch(() => {});
   }, 3000);
 }
@@ -1386,6 +1453,31 @@ function onActivityTabActive() {
   startActivityContextLoop();
   startActivityStream();
 }
+
+function resumeAdminUiAfterWake() {
+  if (document.hidden) return;
+  if (activityTabVisible()) {
+    loadActivity().catch(() => {});
+    refreshActivityContext().catch(() => {});
+    if (activityStreamWanted()) {
+      activityReconnectAttempt = 0;
+      startActivityStream({ restart: true });
+    }
+  } else if (document.getElementById("dashboard")?.classList.contains("active")) {
+    refreshDashboardRuntime().catch(() => {});
+  } else if (document.getElementById("missions")?.classList.contains("active")) {
+    loadMissions().catch(() => {});
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopActivityStream();
+  else resumeAdminUiAfterWake();
+});
+window.addEventListener("online", resumeAdminUiAfterWake);
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) resumeAdminUiAfterWake();
+});
 
 async function loadEnvForm() {
   const data = await api("/api/config/env");
