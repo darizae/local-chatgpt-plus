@@ -12,6 +12,8 @@ export interface PermissionConfig {
   allow_write?: boolean;
   allow_commands?: boolean;
   allow_unsafe_runtimes?: boolean;
+  /** Narrow exception for one root-owned, non-writable bounded agent broker. */
+  trusted_subagent_executable?: string;
   command_allow_patterns?: string[];
   command_deny_patterns?: string[];
 }
@@ -57,6 +59,13 @@ function normalizeConfig(raw: Partial<PermissionConfig> | undefined): Permission
   const pathRoots = optionalStringArray(raw?.path_roots, "path_roots");
   const allowPatterns = optionalStringArray(raw?.command_allow_patterns, "command_allow_patterns");
   const denyPatterns = optionalStringArray(raw?.command_deny_patterns, "command_deny_patterns");
+  const trustedSubagent = raw?.trusted_subagent_executable;
+  if (trustedSubagent !== undefined && (
+    typeof trustedSubagent !== "string" || !path.isAbsolute(trustedSubagent) ||
+    path.normalize(trustedSubagent) !== trustedSubagent || path.basename(trustedSubagent) !== "lcp-native-subagent"
+  )) {
+    throw new Error("trusted_subagent_executable must be an absolute path to lcp-native-subagent");
+  }
   for (const [field, patterns] of [["command_allow_patterns", allowPatterns], ["command_deny_patterns", denyPatterns]] as const) {
     for (const pattern of patterns ?? []) {
       try {
@@ -73,6 +82,7 @@ function normalizeConfig(raw: Partial<PermissionConfig> | undefined): Permission
     allow_write: optionalBoolean(raw?.allow_write, "allow_write"),
     allow_commands: optionalBoolean(raw?.allow_commands, "allow_commands"),
     allow_unsafe_runtimes: optionalBoolean(raw?.allow_unsafe_runtimes, "allow_unsafe_runtimes"),
+    trusted_subagent_executable: trustedSubagent,
     command_allow_patterns: allowPatterns,
     command_deny_patterns: denyPatterns,
   };
@@ -222,5 +232,37 @@ export function requireUnsafeRuntimeAllowed(kind: string): void {
     throw new Error(
       `Permission denied by '${getPermissionProfile()}' profile: ${kind} is an unrestricted runtime and must be explicitly enabled with a custom profile`
     );
+  }
+}
+
+/** A narrowly scoped Linux exception for a root-owned broker executable.
+ * It does not turn on PTY, REPL, direct model CLIs or other unsafe runtimes.
+ * Every path component must be owned by root and non-writable by other users;
+ * symlinks are refused. The broker itself enforces queue budgets and policy.
+ */
+export function requireSubagentRunnerAllowed(executable: string): void {
+  if (canUseUnsafeRuntimes()) return;
+  const policy = getPermissionConfig();
+  const trusted = policy.profile === "custom" ? policy.trusted_subagent_executable : undefined;
+  if (!trusted || executable !== trusted || process.platform !== "linux") {
+    requireUnsafeRuntimeAllowed("subagent runner");
+    return;
+  }
+  try {
+    let current = trusted;
+    while (true) {
+      const info = fs.lstatSync(current);
+      if (info.isSymbolicLink() || info.uid !== 0 || (info.mode & 0o022) !== 0) {
+        throw new Error("path is not root-owned or is writable by non-root users");
+      }
+      if (current === trusted && (!info.isFile() || (info.mode & 0o111) === 0)) {
+        throw new Error("broker is not an executable regular file");
+      }
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  } catch {
+    throw new Error("Permission denied: trusted subagent broker must be a root-owned, non-writable executable with trusted parent directories");
   }
 }
