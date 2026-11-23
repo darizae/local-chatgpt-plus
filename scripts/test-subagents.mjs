@@ -19,6 +19,20 @@ const hooks = await import("../dist/lib/local-hooks.js");
 const taskStore = await import("../dist/lib/agent-task-store.js");
 const workerStore = await import("../dist/lib/worker-registry.js");
 permissions.setPermissionWorkspaceRoots([root]);
+
+assert.deepEqual(
+  subagents.subagentChildEnvironment({
+    PATH: "/usr/bin", HOME: "/tmp/synthetic", LANG: "C",
+    MCP_AUTH_TOKEN: "synthetic-mcp-secret", GITHUB_TOKEN: "synthetic-git-secret",
+    INBOUND_OAUTH_PRIVATE_KEY: "synthetic-key", AWS_SECRET_ACCESS_KEY: "synthetic-cloud",
+  }, undefined, "synthetic-agent"),
+  { PATH: "/usr/bin", HOME: "/tmp/synthetic", LANG: "C", LOCAL_CODER_SUBAGENT_ID: "synthetic-agent" },
+  "delegation must not inherit unrelated parent secrets"
+);
+assert.equal(
+  subagents.subagentChildEnvironment({ PATH: "/usr/bin" }, { CUSTOM_AGENT_VALUE: "synthetic" }, "agent", "task").CUSTOM_AGENT_VALUE,
+  "synthetic", "operator-explicit subagent environment is preserved"
+);
 permissions.savePermissionConfig({ profile: "open" });
 await hooks.saveLocalHooksConfig({ enabled: false, hooks: [] });
 

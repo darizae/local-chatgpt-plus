@@ -85,6 +85,35 @@ const MAX_LOG_CHARS = 1_000_000;
 const MAX_RETAINED_SUBAGENTS = 48;
 const agents = new Map<string, ManagedSubagent>();
 
+/**
+ * Spawned model runners must not receive the entire MCP server environment.
+ * Explicit config.env values are operator-owned; user/repository content
+ * cannot add environment entries through the subagent tool arguments.
+ * This is data minimization, NOT a shell filesystem/process sandbox.
+ */
+export function subagentChildEnvironment(
+  parent: NodeJS.ProcessEnv,
+  configured: Record<string, string> | undefined,
+  id: string,
+  taskId?: string
+): NodeJS.ProcessEnv {
+  const safe = new Set([
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LANGUAGE", "TERM", "COLORTERM", "TZ", "SYSTEMROOT",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+  ]);
+  const result: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(parent)) {
+    if ((safe.has(name) || /^LC_[A-Z_]+$/.test(name) || /^XDG_(CONFIG|CACHE|DATA|STATE|RUNTIME)_HOME$/.test(name)) && value !== undefined) {
+      result[name] = value;
+    }
+  }
+  return {
+    ...result, ...configured, LOCAL_CODER_SUBAGENT_ID: id,
+    ...(taskId ? { LOCAL_CODER_PARENT_TASK_ID: taskId } : {}),
+  };
+}
+
 function pruneFinishedSubagents(): void {
   if (agents.size <= MAX_RETAINED_SUBAGENTS) return;
   const finished = [...agents.values()]
@@ -327,10 +356,7 @@ export async function spawnSubagent(options: {
     throw error;
   }
 
-  const childEnv = {
-    ...process.env, ...config.env, LOCAL_CODER_SUBAGENT_ID: id,
-    ...(taskId ? { LOCAL_CODER_PARENT_TASK_ID: taskId } : {}),
-  };
+  const childEnv = subagentChildEnvironment(process.env, config.env, id, taskId);
   const spawnSpec = await resolveSafeSpawnSpec(config.executable, args, childEnv);
   const child = spawn(spawnSpec.file, spawnSpec.args, {
     cwd: workspace,

@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { randomBytes } from "crypto";
 import { spawn } from "child_process";
+import { loadOAuthKey, loadPreviousOAuthKey, openOAuthStore, saveOAuthStore } from "./oauth-vault.js";
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
@@ -46,6 +47,7 @@ export class FileOAuthClientProvider implements OAuthClientProvider {
   private readonly callbackUrl: string;
   private readonly shouldOpenBrowser: boolean;
   private loaded = false;
+  private migrated = false;
   private store: OAuthStore = {};
 
   constructor(options: FileOAuthProviderOptions) {
@@ -62,26 +64,43 @@ export class FileOAuthClientProvider implements OAuthClientProvider {
 
   private async load(): Promise<OAuthStore> {
     if (this.loaded) return this.store;
+    const key = await loadOAuthKey();
     try {
-      this.store = JSON.parse(await fs.readFile(this.storePath, "utf-8")) as OAuthStore;
+      const text = await fs.readFile(this.storePath, "utf-8");
+      const record = JSON.parse(text) as Record<string, unknown>;
+      try {
+        this.store = openOAuthStore(text, key, this.storePath) as OAuthStore;
+        this.migrated = Boolean(key && record.version === undefined);
+      } catch (error) {
+        // An explicitly configured previous key supports staged rotation:
+        // old ciphertext is authenticated and rewrapped using the new key
+        // only after a successful read. Never fall back to plaintext.
+        if (!key || record.version !== 1 || record.algorithm !== "aes-256-gcm") throw error;
+        const previous = await loadPreviousOAuthKey();
+        if (!previous) throw error;
+        this.store = openOAuthStore(text, previous, this.storePath) as OAuthStore;
+        this.migrated = true;
+      }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       this.store = {};
     }
     this.loaded = true;
+    if (this.migrated) await this.save();
     return this.store;
   }
 
   private async save(): Promise<void> {
     this.store.updatedAt = new Date().toISOString();
-    await fs.mkdir(path.dirname(this.storePath), { recursive: true });
-    const temp = `${this.storePath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    const key = await loadOAuthKey();
+    // Never silently replace ciphertext with plaintext if a key is unset.
     try {
-      await fs.writeFile(temp, JSON.stringify(this.store, null, 2), { encoding: "utf-8", mode: 0o600 });
-      await fs.rename(temp, this.storePath);
-    } finally {
-      await fs.rm(temp, { force: true }).catch(() => undefined);
+      const existing = JSON.parse(await fs.readFile(this.storePath, "utf-8")) as Record<string, unknown>;
+      if (existing.version !== undefined && !key) throw new Error("Encrypted OAuth state requires its key");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
+    await saveOAuthStore(this.storePath, this.store, key);
   }
 
   get redirectUrl(): string {

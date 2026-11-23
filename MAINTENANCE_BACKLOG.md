@@ -26,6 +26,12 @@
 
 ## Follow-up engineering work
 
+- [x] Add opt-in versioned authenticated encryption for upstream OAuth state, key-file permission enforcement and explicit legacy migration consent; synthetic wrong-key/tamper and plaintext canary tests.
+- [x] Minimize inherited external-subagent environment instead of forwarding the MCP process environment wholesale; add synthetic credential noninheritance tests.
+- [ ] Provide OS-backed macOS secret storage and transactional fleet-wide key recovery/rotation; staged per-store rewrapping is available with operator-managed previous key, and existing installations remain plaintext until configured.
+- [ ] Implement provenance-aware handling of persistent agent notes and untrusted MCP/GitHub/tool content, and independently enforced high-risk operation approvals. Content filtering alone is insufficient.
+- [ ] Add OS-level isolation for untrusted subprocesses and enforce independent network/path/Git publishing policy; a worktree is not a sandbox.
+
 - [ ] Improve safe retry/cancellation and crash/reconnect coverage.
 - [ ] Browser/Desktop provider permission review and approval parity.
 - [ ] macOS login/logout, `launchd` and offline availability matrix.
