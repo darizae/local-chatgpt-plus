@@ -51,6 +51,28 @@ await test("disabled subagent runner explains ChatGPT subscription boundary", as
   );
 });
 
+await test("bounded broker permission never enables arbitrary runtimes or executables", async () => {
+  assert.throws(
+    () => permissions.savePermissionConfig({ profile: "custom", trusted_subagent_executable: "./lcp-native-subagent" }),
+    /absolute path/
+  );
+  assert.throws(
+    () => permissions.savePermissionConfig({ profile: "custom", trusted_subagent_executable: "/usr/bin/sh" }),
+    /lcp-native-subagent/
+  );
+  permissions.savePermissionConfig({
+    profile: "custom", path_roots: [root], allow_commands: true, allow_write: true,
+    allow_unsafe_runtimes: false,
+    trusted_subagent_executable: "/usr/local/bin/lcp-native-subagent",
+  });
+  assert.equal(permissions.canUseUnsafeRuntimes(), false);
+  assert.throws(() => permissions.requireUnsafeRuntimeAllowed("node_repl"), /unrestricted runtime/);
+  assert.throws(() => permissions.requireSubagentRunnerAllowed(process.execPath), /unrestricted runtime/);
+  await subagents.saveSubagentConfig({ enabled: true, executable: process.execPath, args: ["--version"] });
+  await assert.rejects(() => subagents.spawnSubagent({ objective: "blocked", workspace: root }), /unrestricted runtime/);
+  permissions.savePermissionConfig({ profile: "open" });
+});
+
 await test("malformed subagent configuration fails visibly", async () => {
   await fs.writeFile(configPath, "{not-json\n", "utf-8");
   await assert.rejects(() => subagents.getSubagentConfig(), /Failed to load subagent config/);

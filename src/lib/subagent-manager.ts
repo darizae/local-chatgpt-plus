@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import {
   requireCommandAllowed,
-  requireUnsafeRuntimeAllowed,
+  requireSubagentRunnerAllowed,
   requireWriteAllowed,
 } from "./permissions.js";
 import { runLocalHooks } from "./local-hooks.js";
@@ -326,7 +326,7 @@ export async function spawnSubagent(options: {
       "Invalid subagent config: prompt_via_stdin=false requires at least one args entry containing {prompt}"
     );
   }
-  requireUnsafeRuntimeAllowed("subagent runner");
+  requireSubagentRunnerAllowed(config.executable);
   const id = randomUUID().slice(0, 12);
   const isolation = options.isolation ?? config.isolation;
   const requestedWorkspace = await validatePath(options.workspace);
