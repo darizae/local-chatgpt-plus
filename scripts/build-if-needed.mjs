@@ -28,7 +28,7 @@ async function exists(target) {
 async function fingerprint() {
   const files = [
     ...await walk(path.join(root, "src")),
-    ...["package.json", "package-lock.json", "tsconfig.json"]
+    ...["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig.json"]
       .map((name) => path.join(root, name))
       .filter((target) => target),
   ].sort();
@@ -66,7 +66,7 @@ if (!force && previous?.fingerprint === current.value && await exists(distEntry)
 console.log(force ? "[Build] Forced rebuild." : "[Build] Source changed - compiling.");
 const tsc = path.join(root, "node_modules", "typescript", "bin", "tsc");
 if (!(await exists(tsc))) {
-  console.error("[Build] TypeScript compiler is missing. Run npm install first.");
+  console.error("[Build] TypeScript compiler is missing. Run pnpm install --frozen-lockfile first.");
   process.exit(1);
 }
 const built = spawnSync(process.execPath, [tsc], {

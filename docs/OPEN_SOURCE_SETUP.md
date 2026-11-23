@@ -4,7 +4,7 @@ This guide is for a **new machine**, not for migrating an existing live installa
 
 ## Give this to your coding agent
 
-> Clone `https://github.com/darizae/local-chatgpt-plus` into a new directory on my Mac. Read `AGENTS.md`, `README.md`, `docs/OPEN_SOURCE_SETUP.md`, and `docs/INBOUND_OAUTH_GUIDE.md` before making changes. Verify macOS, Node.js >=22.22.2, npm, and Git. Use `npm ci`, `npm run build`, `npm run test:smoke`, and `npm test` in an isolated checkout. Do **not** start the daemon, install launchd jobs, alter login items/macOS security settings, expose a public port, import credentials, configure external providers, or change any running service without asking me. Make a fresh disposable `WORKSPACE_PATH` and a private `PERMISSIONS_CONFIG` (workspace profile). Keep `.env` private (mode 600) and disable Admin by default. Report manual OAuth/tunnel/ChatGPT steps, missing prerequisites, and test results. Never print secrets or paste sensitive file contents into the chat.
+> Clone `https://github.com/darizae/local-chatgpt-plus` into a new directory on my Mac. Read `AGENTS.md`, `README.md`, `docs/OPEN_SOURCE_SETUP.md`, and `docs/INBOUND_OAUTH_GUIDE.md` before making changes. Verify macOS, Node.js >=22.22.2, pnpm 11.1.3, and Git. In an isolated checkout run `pnpm install --frozen-lockfile --ignore-scripts`, verify signatures and advisories with `pnpm audit signatures`, `pnpm audit --prod`, `pnpm audit`, and `node scripts/check-osv-dependencies.mjs`, then run approved builds with `pnpm rebuild`, followed by `pnpm run build`, `pnpm run test:smoke`, and `pnpm test`. Do **not** start the daemon, install launchd jobs, alter login items/macOS security settings, expose a public port, import credentials, configure external providers, or change any running service without asking me. Make a fresh disposable `WORKSPACE_PATH` and a private `PERMISSIONS_CONFIG` (workspace profile). Keep `.env` private (mode 600) and disable Admin by default. Report manual OAuth/tunnel/ChatGPT steps, missing prerequisites, and test results. Never print secrets or paste sensitive file contents into the chat.
 
 ## Local bootstrap
 
@@ -12,10 +12,15 @@ This guide is for a **new machine**, not for migrating an existing live installa
 2. Run:
 
 ```bash
-npm ci
-npm run build
-npm run test:smoke
-npm test
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm audit signatures
+pnpm audit --prod
+pnpm audit
+node scripts/check-osv-dependencies.mjs
+pnpm rebuild
+pnpm run build
+pnpm run test:smoke
+pnpm test
 mkdir -p "$HOME/lcp-workspace"
 cp .env.example .env
 chmod 600 .env
@@ -36,7 +41,7 @@ INBOUND_AUTH_MODE=token
 MCP_TOKEN=<GENERATE_LOCALLY_AND_KEEP_PRIVATE>
 ```
 
-Generate a random token locally using `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`. Replace the placeholder, never commit `.env`. Do **not** expose `/mcp` with an empty token. Start with `npm start` and inspect `http://127.0.0.1:3000/health`. Stop with Ctrl-C before changing configuration.
+Generate a random token locally using `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`. Replace the placeholder, never commit `.env`. Do **not** expose `/mcp` with an empty token. Start with `pnpm start` and inspect `http://127.0.0.1:3000/health`. Stop with Ctrl-C before changing configuration.
 
 ## Authentication choices
 
@@ -54,4 +59,4 @@ Generate a random token locally using `node -e "console.log(require('crypto').ra
 
 ## Before allowing an agent full access
 
-Run `git status --short` and `npm run test:smoke`. Confirm the selected permission profile is **not** `open`; `WORKSPACE_PATH` alone does not restrict shell access. Grant `commands:execute`, computer use, upstream MCP connections and subagent execution only if needed. Do not enable public access until [release security gates](OPEN_SOURCE_RELEASE_SECURITY.md) are satisfied.
+Run `git status --short` and `pnpm run test:smoke`. Confirm the selected permission profile is **not** `open`; `WORKSPACE_PATH` alone does not restrict shell access. Grant `commands:execute`, computer use, upstream MCP connections and subagent execution only if needed. Do not enable public access until [release security gates](OPEN_SOURCE_RELEASE_SECURITY.md) are satisfied.

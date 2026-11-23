@@ -61,7 +61,7 @@ flowchart LR
 
 ## Requirements and quick start
 
-- macOS, Node.js **22.22.2+**, npm; Git for Git-related tools.
+- macOS, Node.js **22.22.2+**, pnpm **11.1.3**; Git for Git-related tools.
 - An HTTPS tunnel if connecting a hosted ChatGPT client to the local server.
 
 ```bash
@@ -74,8 +74,14 @@ node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
 # Configure explicit workspace permissions (the example is not an OS sandbox):
 cp profiles/permissions.example.json profiles/permissions.json
 # Set PERMISSIONS_CONFIG=profiles/permissions.json in .env.
-npm ci
-npm start
+# Inspect and verify the locked artifacts before allowing native build scripts:
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm audit signatures
+pnpm audit --prod
+pnpm audit
+node scripts/check-osv-dependencies.mjs
+pnpm rebuild     # approved esbuild/fsevents/node-pty scripts + local PTY fix
+pnpm start
 ```
 
 The local MCP server defaults to `http://127.0.0.1:3000`; check `http://127.0.0.1:3000/health`. The optional **Admin UI** is available at `http://localhost:3001/ui/` when enabled and **requires a locally generated `ADMIN_TOKEN`** for bootstrapping and recovery. On macOS, you can also enroll a [Touch ID / Apple Passwords passkey](docs/ADMIN_PASSKEYS.md) for routine Admin login. Passkeys are bound to `localhost` (not numeric `127.0.0.1`); the Admin server still binds to loopback. Browser access requires an HttpOnly same-site cookie **and** a separate origin-scoped session proof (because localhost cookies cross ports), plus CSRF on writes; local automation may use a Bearer token. The new-install defaults disable Admin and ChatGPT auto-approval. Enabling Admin also enables its settings and upstream OAuth callback endpoints. Never tunnel Admin. The terminal dashboard starts automatically in an interactive terminal; set `LOCAL_CODER_TUI=off` for normal logs.
@@ -150,7 +156,7 @@ inside the disposable root. Full setup and cutover steps:
 [Tunnel options → OpenAI Secure MCP Tunnel](docs/OPERATIONS.md#tunnel-options) and
 the [Inbound OAuth guide](docs/INBOUND_OAUTH_GUIDE.md).
 
-1. Start the server (`npm start`) and run `tunnel-client run --profile-file ~/lcp-tunnel.yaml`.
+1. Start the server (`pnpm start`) and run `tunnel-client run --profile-file ~/lcp-tunnel.yaml`.
 2. In ChatGPT Plugins → **Add custom MCP server**, enter the name/description,
    pick **Connection: Tunnel**, select the provisioned tunnel, and choose
    **Authentication: OAuth**.
@@ -165,7 +171,7 @@ the [Inbound OAuth guide](docs/INBOUND_OAUTH_GUIDE.md).
 `INBOUND_AUTH_MODE=token`, in the ChatGPT form choose **No authentication** (the
 tunnel is the transport boundary; the local `MCP_TOKEN` still gates the server).
 A public HTTPS endpoint is an alternative when a Secure MCP Tunnel is not
-available: expose port 3000 with a trusted HTTPS tunnel (e.g. `npm run tunnel`
+available: expose port 3000 with a trusted HTTPS tunnel (e.g. `pnpm run tunnel`
 Cloudflare Quick Tunnel) and set the connector URL to
 `https://<your-tunnel-host>/mcp/<MCP_TOKEN>`. An empty `MCP_TOKEN` causes startup to fail in token mode except for explicitly
 marked, loopback-only automated test fixtures; there is no unauthenticated
@@ -294,14 +300,14 @@ Saved `agent_task` plans are not autonomous workers. `agent_task get/list/resume
 ## Development and verification
 
 ```bash
-npm run build
-npm test
-npm run test:smoke        # read-only fail-closed security pre-flight (fast)
-npm run test:integration
-npm run test:all
+pnpm run build
+pnpm test
+pnpm run test:smoke        # read-only fail-closed security pre-flight (fast)
+pnpm run test:integration
+pnpm run test:all
 ```
 
-The smoke check (`npm run test:smoke`) asserts that Auth0 token-vs-oauth config
+The smoke check (`pnpm run test:smoke`) asserts that Auth0 token-vs-oauth config
 validation, Admin loopback isolation, permission-profile fail-closed, path/
 symlink escapes, upstream allowlist, and headless-approval denial all fail
 closed, plus a native PTY / language-server smoke when the dependency is

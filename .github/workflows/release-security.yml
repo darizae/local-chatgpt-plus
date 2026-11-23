@@ -1,9 +1,8 @@
 name: Release security gates
 
 # Runs on demand for release validation and on every push to default branches.
-# Read-only, secret-free: it never uploads repository content to a third party
-# and has no access to repository secrets. Any credential must come from the
-# repository itself, never from CI configuration.
+# No repository secrets are supplied. Registry / OSV checks transmit only
+# public dependency metadata, not source files, credentials, or test fixtures.
 on:
   push:
     branches: [main]
@@ -26,20 +25,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Enforce a single pinned package manager
+        run: |
+          test ! -e package-lock.json
+          test ! -e npm-shrinkwrap.json
+          node -e 'if (!/^pnpm@[0-9]+\.[0-9]+\.[0-9]+$/.test(require("./package.json").packageManager)) process.exit(1)'
+
+      - name: Set up pinned pnpm
+        uses: pnpm/action-setup@v6
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: pnpm
 
-      - name: Install locked dependencies
-        run: npm ci
+      - name: Install locked dependencies without executing lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify registry package signatures before executing build scripts
+        run: pnpm audit signatures
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod
+
+      - name: Audit all dependencies (including dev)
+        run: pnpm audit
+
+      - name: Cross-check all pinned dependencies with OSV
+        run: node scripts/check-osv-dependencies.mjs
+
+      - name: Run approved native dependency builds and root postinstall
+        run: pnpm rebuild
 
       - name: Build
-        run: npm run build
+        run: pnpm run build
 
       - name: Smoke security check
-        run: npm run test:smoke
+        run: pnpm run test:smoke
 
       # A few regression fixtures intentionally run commands outside the
       # checkout and test unsafe runtimes. The default production policy still
@@ -52,16 +75,10 @@ jobs:
       - name: Unit/regression suite
         env:
           PERMISSIONS_CONFIG: ${{ runner.temp }}/lcp-ci/permissions.json
-        run: npm test
+        run: pnpm test
 
       - name: Integration suite
-        run: npm run test:integration
-
-      - name: Audit production dependencies
-        run: npm audit --omit=dev
-
-      - name: Audit all dependencies (incl. dev)
-        run: npm audit
+        run: pnpm run test:integration
 
       - name: Tracked-HEAD credential pattern gate
         run: node scripts/check-publication-content.mjs

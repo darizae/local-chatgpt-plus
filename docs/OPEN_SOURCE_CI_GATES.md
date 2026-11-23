@@ -10,20 +10,25 @@ tripwire `scripts/check-publication-content.mjs`.
 macOS-first project) on every push and pull request targeting `main`, and via manual dispatch. It is a
 local, self-contained gate: the job has `permissions: contents: read`, receives
 **no** repository secrets, and runs only the repository's own scripts and
-official GitHub Actions. It never uploads repository content to any third-party
-secret-scanning service.
+maintained upstream actions. It never uploads repository source or secrets to a
+third-party secret-scanning service; it sends public package names/versions to
+the npm registry and OSV for dependency/security checks.
 
 Steps, in order:
 
-1. `npm ci` — clean install from the locked `package-lock.json`.
-2. `npm run build` — TypeScript compile (`tsc`) to `dist/`.
-3. `npm run test:smoke` — fast fail-closed security smoke check.
-4. `npm test` — unit/regression suite.
-5. `npm run test:integration` — MCP bridge integration suite.
-6. `npm audit --omit=dev` — production dependency advisory check.
-7. `npm audit` — production + dev dependency advisory check.
-8. `node scripts/check-publication-content.mjs` — tracked-HEAD credential
-   pattern tripwire.
+1. Reject legacy npm lockfiles, then install the pinned pnpm version from
+   `packageManager` and Node.js 22.
+2. `pnpm install --frozen-lockfile --ignore-scripts` — clean, script-free install from `pnpm-lock.yaml`.
+3. `pnpm audit signatures` — verify package signatures before running reviewed scripts.
+4. `pnpm audit --prod`, `pnpm audit`, and `node scripts/check-osv-dependencies.mjs` — advisory checks across the dependency graph.
+5. `pnpm rebuild` — run approved dependency builds and the root `postinstall`
+   after signature and advisory checks.
+6. `pnpm run build` — TypeScript compile (`tsc`) to `dist/`.
+7. `pnpm run test:smoke` — fast fail-closed security smoke check.
+8. `pnpm test` — unit/regression suite, including the postinstall and OSV tests.
+9. `pnpm run test:integration` — MCP bridge integration suite.
+10. `node scripts/check-publication-content.mjs` — tracked-HEAD credential
+    pattern tripwire.
 
 The **unit/regression** step alone creates an ephemeral `open` permission
 profile in the runner's temporary directory. Several tests intentionally
@@ -82,6 +87,6 @@ the `ALLOWLIST` set in the script, not a loose pattern.
 - **No secret access by design.** The workflow has no repository secrets and
   cannot validate runtime credentials or OAuth flows; those remain manual,
   controlled validation gates (see `OPEN_SOURCE_RELEASE_SECURITY.md`).
-- **`npm audit` reflects known advisories only.** Zero findings is not proof
+- **`pnpm audit` and OSV reflect known advisories only.** Zero findings is not proof
   the supply chain is flawless; lockfile provenance and license attribution are
   reviewed separately.

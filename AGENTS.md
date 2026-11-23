@@ -160,7 +160,7 @@ When starting a task-owned runner, pass `task_id` to `start_process` or `subagen
 
 Failed, stopped, timed-out, or interrupted linked workers leave bounded, sanitized execution receipts. HTTP 401 authentication and 429 rate-limit failures are classified without saving provider secrets in task records. These events **never** silently retry edits, mark a plan step completed, or clean a dirty worktree. Review worker output and Git state, then resume explicitly. `verify_project(task_id=...)` now stores a bounded verification checkpoint (pass/fail, check count, Git revision, dirty flag, and worktree path) without completing the plan. If commits appear after the last plan update, the status reports possible Git/plan drift; a commit does not prove verification. Explicitly mark steps after reviewing that evidence.
 
-As with other TypeScript source changes, compile with `npm run build` before restarting LCP. Its installed shell controller (`~/.local/bin/lcp`) is separate and only needs reinstallation if `scripts/lcp` or its installer changes. Do not restart LCP while other owned workers are performing work unless the operator intends to interrupt them.
+As with other TypeScript source changes, compile with `pnpm run build` before restarting LCP. Its installed shell controller (`~/.local/bin/lcp`) is separate and only needs reinstallation if `scripts/lcp` or its installer changes. Do not restart LCP while other owned workers are performing work unless the operator intends to interrupt them.
 
 ## `lcp` controller — edits must be synced to the installed binary
 
@@ -193,11 +193,16 @@ install path or command ever changes.
 
 ```bash
 cp .env.example .env
-npm ci
-npm start          # build + MCP server, TUI and optional Admin UI
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm audit signatures
+pnpm audit --prod
+pnpm audit
+node scripts/check-osv-dependencies.mjs
+pnpm rebuild
+pnpm start          # build + MCP server, TUI and optional Admin UI
 # or: sh scripts/start-macos.sh
 # Terminal 2, if using Cloudflare Quick Tunnel:
-npm run tunnel
+pnpm run tunnel
 # or another HTTPS tunnel, for example:
 ssh -p 443 -R0:localhost:3000 a.pinggy.io
 ```
@@ -262,7 +267,7 @@ process.
 | ChatGPT asks on every call | Review connector permissions and `CHATGPT_AUTO_APPROVE`. |
 | Connection failed | Ensure both server and tunnel are running, and use the correct HTTPS connector URL. |
 | Tool not found | Check the active profile/overrides with `agent_status` or the Admin UI. |
-| Connector hangs after a schema update | Run `npm run build`, restart the server, refresh the connector, and start a new chat. |
+| Connector hangs after a schema update | Run `pnpm run build`, restart the server, refresh the connector, and start a new chat. |
 | `stream canceled` | The MCP stream was closed/reset; keep services stable, refresh, and reconnect. |
 
 Some wrapper tools may be rejected by the host client's safety layer even when the same local operation is valid. Where appropriate, use an equivalent `run_command` fallback and verify the result.

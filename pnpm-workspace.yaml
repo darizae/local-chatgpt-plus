@@ -1,4 +1,9 @@
+# pnpm 11 runs dependency lifecycle scripts only for explicitly approved
+# packages. Fail rather than silently skipping newly introduced build scripts.
+strictDepBuilds: true
+# Approve only the versions reviewed with pnpm-lock.yaml. A version change
+# must be separately reviewed before its new lifecycle scripts can run.
 allowBuilds:
-  esbuild: true
-  fsevents: true
-  node-pty: true
+  'esbuild@0.28.2': true
+  'fsevents@2.3.3': true
+  'node-pty@1.1.0': true
