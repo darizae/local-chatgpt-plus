@@ -144,10 +144,77 @@ await run("background process spawn failure stays inside the tool call", async (
 await run("view_image returns MCP image content", async () => {
   const png = path.join(tmp, "pixel.png");
   const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z9xkAAAAASUVORK5CYII=";
-  await fs.writeFile(png, Buffer.from(onePixelPng, "base64"));
+  const original = Buffer.from(onePixelPng, "base64");
+  await fs.writeFile(png, original);
   const result = await call("view_image", { path: png });
-  const image = result.content?.find((item) => item.type === "image");
-  if (!image || image.mimeType !== "image/png" || !image.data) throw new Error(JSON.stringify(result));
+  const images = result.content?.filter((item) => item.type === "image") || [];
+  if (result.isError || images.length !== 1 || images[0].mimeType !== "image/png") {
+    throw new Error("Expected exactly one successful PNG ImageContent block");
+  }
+  if (!Buffer.from(images[0].data, "base64").equals(original)) {
+    throw new Error("MCP image payload differs from the source file");
+  }
+  const metadata = result.structuredContent?.data;
+  if (metadata?.bytes !== original.length || metadata?.mime_type !== "image/png") {
+    throw new Error(`Incorrect image metadata: ${JSON.stringify(metadata)}`);
+  }
+});
+
+await run("view_image labels supported extensions and rejects unsupported formats", async () => {
+  const contents = Buffer.from("synthetic image bytes", "utf8");
+  for (const [extension, expectedMime] of [
+    [".PNG", "image/png"], [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"],
+    [".webp", "image/webp"], [".gif", "image/gif"],
+  ]) {
+    const file = path.join(tmp, `format${extension}`);
+    await fs.writeFile(file, contents);
+    const result = await call("view_image", { path: file });
+    const image = result.content?.find((item) => item.type === "image");
+    if (result.isError || image?.mimeType !== expectedMime || !Buffer.from(image.data, "base64").equals(contents)) {
+      throw new Error(`Incorrect extension-based MIME response for ${extension}`);
+    }
+  }
+  const svg = path.join(tmp, "unsupported.svg");
+  await fs.writeFile(svg, "<svg/>");
+  const result = await call("view_image", { path: svg });
+  if (!result.isError || !/Unsupported image format/.test(JSON.stringify(result))) {
+    throw new Error("Unsupported image extension was not rejected");
+  }
+});
+
+await run("view_image rejects files larger than 5 MiB before returning image data", async () => {
+  const file = path.join(tmp, "oversized.png");
+  const handle = await fs.open(file, "w");
+  try { await handle.truncate(5 * 1024 * 1024 + 1); }
+  finally { await handle.close(); }
+  const result = await call("view_image", { path: file });
+  if (!result.isError || !/Image is too large/.test(JSON.stringify(result))) {
+    throw new Error("Oversized image was not explicitly rejected");
+  }
+  if (result.content?.some((item) => item.type === "image")) {
+    throw new Error("Oversized image leaked image content");
+  }
+});
+
+await run("view_image respects configured path-root permissions", async () => {
+  const file = path.join(tmp, "forbidden.png");
+  await fs.writeFile(file, Buffer.from("synthetic"));
+  const allowed = path.join(tmp, "allowed");
+  await fs.mkdir(allowed, { recursive: true });
+  await fs.writeFile(process.env.PERMISSIONS_CONFIG, JSON.stringify({
+    version: 1, profile: "workspace", path_roots: [allowed],
+  }));
+  try {
+    const result = await call("view_image", { path: file });
+    if (!result.isError || !/Permission denied/.test(JSON.stringify(result))) {
+      throw new Error("File outside configured roots was not denied");
+    }
+    if (result.content?.some((item) => item.type === "image")) {
+      throw new Error("Denied file leaked image content");
+    }
+  } finally {
+    await fs.writeFile(process.env.PERMISSIONS_CONFIG, JSON.stringify({ version: 1, profile: "open" }));
+  }
 });
 
 await run("oversized native tool results fail explicitly before transport", async () => {
