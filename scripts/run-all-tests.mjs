@@ -89,8 +89,8 @@ const isolatedEnv = {
   MCP_SESSION_RECOVERY: "true",
 };
 
-console.log("=== Full npm test suite ===");
-await runProcess("npm", ["test"], isolatedEnv);
+console.log("=== Full pnpm test suite ===");
+await runProcess("pnpm", ["test"], isolatedEnv);
 
 console.log("\n=== Integration (spawn server) ===");
 const server = spawn(process.execPath, ["dist/index.js"], {

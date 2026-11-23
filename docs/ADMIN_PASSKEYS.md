@@ -55,10 +55,12 @@ Passkeys authenticate the Admin **browser**. Admin browser sessions also require
 ## Test and deployment notes
 
 ```bash
-npm ci
-npm run build
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm audit signatures
+pnpm rebuild
+pnpm run build
 node scripts/test-admin-passkeys.mjs
-npm test
+pnpm test
 ```
 
 The passkey test uses a **synthetic FIDO2 P-256 authenticator** to verify actual registration signatures, exact-origin and user-verification enforcement, challenge replay denial, persisted 0600 metadata, and token-session-only revocation. It does **not** enroll a real Touch ID credential, touch Apple Passwords, or affect the existing installed MCP service.

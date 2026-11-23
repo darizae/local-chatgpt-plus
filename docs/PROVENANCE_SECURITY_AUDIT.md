@@ -3,6 +3,12 @@
 **Audit date:** 2026-11-19  
 **Project:** Local ChatGPT Plus (`local-chatgpt-plus`)
 
+**Historical snapshot:** The npm/pnpm dual-manager instructions below describe
+the 2026-11-19 state. As of 2026-11-23 the active checkout uses pnpm only:
+`packageManager: pnpm@11.1.3`, `pnpm-lock.yaml`, and an approved-build policy in
+`pnpm-workspace.yaml`. The npm lockfile and npm-only `allowScripts` field were
+removed. See [CI gates](OPEN_SOURCE_CI_GATES.md) for the current install process.
+
 ## Scope and method
 
 Reviewed all repository source, scripts, profiles, active documentation, package manifests, and files intended for the initial commit. Checks included inherited-name/URL/path searches, credential-pattern searches, binary/asset inventory, package lifecycle review, resolved dependency audits, installed-package license inventory, and manual review of entrypoints and security-sensitive configuration.

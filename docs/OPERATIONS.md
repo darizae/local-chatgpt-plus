@@ -47,7 +47,8 @@ installed, enabled, and configured in `profiles/mcp-upstream.json`, each with
 | Reached via | `computer_observe`/`computer_act` with `provider: "desktop"` | same with `provider: "browser"` |
 | Key tools (allowlisted) | `desktop_snapshot`, `desktop_list_windows`, `desktop_find`, `desktop_screenshot`, `desktop_status`, `desktop_permissions`, `desktop_click`, `desktop_type`, `desktop_focus_window`, `desktop_scroll` | `agent_browser_snapshot`, `agent_browser_get_text`, `agent_browser_get_cdp_url`, `agent_browser_connect`, `agent_browser_open`, `agent_browser_click`, `agent_browser_fill`, `agent_browser_press`, `agent_browser_wait_for_*`, tab tools |
 
-Installation (run once; install is not required again on every start):
+Optional external computer-use integrations (installed separately from this
+project's pnpm-locked dependencies; do not reinstall during an LCP upgrade):
 
 ```bash
 npm install -g --allow-scripts=agent-browser,agent-desktop agent-desktop agent-browser
@@ -400,7 +401,7 @@ Start in two terminals:
 
 ```bash
 cd /Users/you/repos/local-chatgpt-plus
-npm start
+pnpm start
 # second terminal:
 tunnel-client run --profile-file ~/lcp-tunnel.yaml
 ```
@@ -561,7 +562,7 @@ provide, so it stays Terminal-only.
 The same commands used before the controller, for debugging or a bare run:
 
 ```bash
-cd /Users/you/repos/local-chatgpt-plus && npm start
+cd /Users/you/repos/local-chatgpt-plus && pnpm start
 tunnel-client run --profile-file ~/lcp-tunnel.yaml
 
 curl -fsS http://127.0.0.1:3000/health
@@ -577,7 +578,7 @@ Stop with `Ctrl+C` in both terminals (only those processes). Confirm ports
 1. Edit `.env`: `INBOUND_AUTH_MODE=token` (keep `MCP_TOKEN` set).
 2. Restore the tokenized tunnel profile (`server_urls` → `/mcp/<MCP_TOKEN>`,
    health `8080`, no OAuth blocks).
-3. `npm start` + `tunnel-client run`, then reconnect ChatGPT with **No
+3. `pnpm start` + `tunnel-client run`, then reconnect ChatGPT with **No
    authentication**.
 
 ### Option B — Cloudflare Quick Tunnel
@@ -587,9 +588,9 @@ Free, but the HTTPS URL changes on each restart. Requires `cloudflared`
 
 ```bash
 # Terminal 1
-npm start
+pnpm start
 # Terminal 2
-npm run tunnel  # cloudflared tunnel --url http://localhost:3000
+pnpm run tunnel  # cloudflared tunnel --url http://localhost:3000
 ```
 
 **Requires outbound port 7844** (TCP *and* UDP) to `*.argotunnel.com`. Many corporate/school/hotel networks block it, and `--protocol http2` does **not** help — it still uses 7844. Check with:
@@ -606,7 +607,7 @@ Pure SSH over port **443**, so it survives networks that block 7844. No install,
 
 ```bash
 # Terminal 1
-npm start
+pnpm start
 
 # Terminal 2
 ssh -p 443 -R0:localhost:3000 a.pinggy.io
@@ -627,7 +628,7 @@ The default `slim` profile is intentionally optimized for regular ChatGPT: it cu
 Run the production benchmark/fault suite with:
 
 ```bash
-npm run benchmark:agent
+pnpm run benchmark:agent
 ```
 
 It starts isolated real MCP servers and checks the intended Codex-like workflow rather than only unit-level functions: compound repo inspection/read round trips, repository intelligence, verification-output compaction, durable `coding_loop` restart/resume, `context_capsule` recovery after a simulated lost ChatGPT/MCP session, fail → diagnose → repair → pass behavior, and malformed persistent-state resilience. Phase 4 guards the default profile at **≤50 slim tools**, **≤64 KiB `tools/list`**, **≤12,000 instruction characters**, and bounded high-level tool responses so future features cannot silently inflate ChatGPT context/transport cost.
@@ -635,7 +636,7 @@ It starts isolated real MCP servers and checks the intended Codex-like workflow 
 Phase 5 adds a fault-focused efficiency suite:
 
 ```bash
-npm run test:phase5
+pnpm run test:phase5
 ```
 
 It covers concurrent idempotency, crash-resumable parallel batches, dirty-worktree mutation detection, ambiguous project aliases, verification-cache invalidation, cache coherency, runtime-identity side effects, ephemeral-state pruning, large-result handles, structured no-match errors, and runtime telemetry. These tests exist specifically to catch orchestration failures that can pass ordinary compile/unit checks.
@@ -643,7 +644,7 @@ It covers concurrent idempotency, crash-resumable parallel batches, dirty-worktr
 Phase 6 adds reliability/isolation coverage:
 
 ```bash
-npm run test:phase6
+pnpm run test:phase6
 ```
 
 It verifies that fresh ChatGPT MCP transports do not inherit hidden shell cwd, explicit per-call project scope blocks accidental cross-project mutation, durable task/capsule state survives changing transport IDs, moved Git repos reconcile by remote identity, abandoned transactions preserve current files, automatic context checkpoints deduplicate unchanged state, and the integrated tunnel supervisor has safe disabled/unconfigured states.
@@ -681,7 +682,7 @@ It verifies that fresh ChatGPT MCP transports do not inherit hidden shell cwd, e
 
 | Tool | Description |
 |------|-------------|
-| `run_command` | Run bounded shell commands (`npm test`, builds, …). Supports optional idempotency/mutation tracking and transaction-aware shell edits |
+| `run_command` | Run bounded shell commands (`pnpm test`, builds, …). Supports optional idempotency/mutation tracking and transaction-aware shell edits |
 | `run_commands_parallel` | Run independent commands concurrently in isolated shell processes; batches persist per-member completion so failed/incomplete members can be retried without rerunning successful siblings |
 | `shell_status` / `shell_reset` | Transport-local shell state. ChatGPT calls do **not** share hidden cwd by default; use explicit `working_directory` |
 | `start_process` | Long-running / background commands |
@@ -763,10 +764,10 @@ Projects can override the auto-discovered verification recipe with `.local-coder
 ```json
 {
   "version": 1,
-  "quick": ["npm run build"],
+  "quick": ["pnpm run build"],
   "full": [
-    { "label": "build", "command": "npm run build", "timeout_seconds": 180 },
-    { "label": "tests", "command": "npm test", "timeout_seconds": 600 }
+    { "label": "build", "command": "pnpm run build", "timeout_seconds": 180 },
+    { "label": "tests", "command": "pnpm test", "timeout_seconds": 600 }
   ]
 }
 ```
@@ -898,7 +899,7 @@ The `scripts/lcp` controller now keeps the stored access mode honest:
 
 ## Administration interface
 
-A local web console ships with the server. It starts by default with `npm start` (same process, separate port); set `LOCAL_CODER_ADMIN_ENABLED=false` to disable it when Admin settings and OAuth callbacks are unnecessary.
+A local web console ships with the server. It starts by default with `pnpm start` (same process, separate port); set `LOCAL_CODER_ADMIN_ENABLED=false` to disable it when Admin settings and OAuth callbacks are unnecessary.
 
 ```
 http://127.0.0.1:3001/ui          # or your ADMIN_PORT
@@ -959,25 +960,25 @@ src/
 ## Development
 
 ```bash
-npm run build          # compile TypeScript
-npm test               # patch + tool unit tests
-npm run test:smoke     # read-only pre-flight security smoke (see below)
-npm run test:integration  # MCP bridge integration on random ports
-npm run test:all       # full isolated suite (server boot, disposable dirs/ports)
-npm run dev            # watch mode (tsx)
+pnpm run build          # compile TypeScript
+pnpm test               # patch + tool unit tests
+pnpm run test:smoke     # read-only pre-flight security smoke (see below)
+pnpm run test:integration  # MCP bridge integration on random ports
+pnpm run test:all       # full isolated suite (server boot, disposable dirs/ports)
+pnpm run dev            # watch mode (tsx)
 node scripts/test-mcp-session.mjs   # integration test (server must be running)
 ```
 
 ## Verification: local smoke vs live maintenance-window validation
 
-`npm run build`, `npm test`, `npm run test:integration` and `npm run test:all`
+`pnpm run build`, `pnpm test`, `pnpm run test:integration` and `pnpm run test:all`
 all run **locally and isolated**: disposable temp state, random (non-production)
 ports, no real `.env`, no Auth0, no public tunnel, no OS GUI prompts, and no real
-launchd service. `npm run test:all` already boots the real server on ephemeral
+launchd service. `pnpm run test:all` already boots the real server on ephemeral
 ports with isolated env and asserts health/Admin/tools. These prove the code's
 fail-closed behavior, **not** the deployed connection.
 
-`npm run test:smoke` (`node scripts/smoke-security-check.mjs`) is a fast,
+`pnpm run test:smoke` (`node scripts/smoke-security-check.mjs`) is a fast,
 server-less pre-flight that asserts, at the module layer, that the security
 surfaces actually fail closed:
 
@@ -1018,10 +1019,10 @@ lcp status                       # authMode + profile + health; stored vs runtim
 lsof -nP -iTCP:3000,3001,8090 -sTCP:LISTEN   # must be empty (or only the real managed job)
 
 # 1. Local read-only / isolated verification (safe any time, no live resources)
-npm run build
-npm run test:smoke                 # fail-closed security pre-flight
-npm run test:all                   # full isolated suite (spawns server on random ports)
-npm run test:integration
+pnpm run build
+pnpm run test:smoke                 # fail-closed security pre-flight
+pnpm run test:all                   # full isolated suite (spawns server on random ports)
+pnpm run test:integration
 
 # 2. LIVE-ONLY checks — require the authorized window + real credentials.
 #    These are the P0.5/P0.6 items the isolated suite cannot cover:
@@ -1068,19 +1069,19 @@ OAuth authenticates the user; it does **not** sandbox shell commands. See the
 |---------|-----|
 | **"Error in message stream"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local ChatGPT Plus`** in the message. Then retry. |
 | **Resource not found** on tool call | Refresh connector + new chat and ensure the latest build is running. Durable task/loop/capsule recovery uses explicit IDs/workspaces rather than assuming one stable MCP transport per chat. |
-| **Connection failed** | Check `npm start` + tunnel are both running. URL must be HTTPS. |
+| **Connection failed** | Check `pnpm start` + tunnel are both running. URL must be HTTPS. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
 | **Tool blocked by host safety** | Review the requested action and permissions; do not use a different tool merely to bypass a safety restriction. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Long tool-heavy turn looks frozen / tunnel log shows HTTP 413** | A tool result exceeded the secure tunnel body limit. Local ChatGPT Plus rejects oversized results before transport; use `read_text_file` offset/limit, smaller base64 chunks, or a shallower tree/search. |
 | **`JavaScript heap out of memory` after many hours/tool calls** | Run `agent_status(mode="doctor")` and inspect heap/cache pressure. Phase 5 bounds text/context caches and retained MCP/process/PTY/subagent/LSP state; on older builds restart after saving durable state, update, then re-test the long-run workload. |
 | **Tunnel URL keeps changing** | Use a stable tunnel ID with a macOS-compatible tunnel client. |
-| **Connector stuck "loading" forever when you click Create** | Make sure you are on the latest build (`npm run build`) — older builds deadlocked on the SSE stream and never answered `tools/list`. Also confirm the URL includes `/mcp/<MCP_TOKEN>`. |
+| **Connector stuck "loading" forever when you click Create** | Make sure you are on the latest build (`pnpm run build`) — older builds deadlocked on the SSE stream and never answered `tools/list`. Also confirm the URL includes `/mcp/<MCP_TOKEN>`. |
 | **404 on the connector URL** | You omitted the token. Use `https://<tunnel>/mcp/<MCP_TOKEN>`, not `/mcp`. |
 | **cloudflared never prints "Registered tunnel connection"** | Network blocks port 7844. `--protocol http2` will not help (same port). Use Pinggy — Option C. |
 | **`EADDRINUSE` on 3001 at startup** | Something else owns the admin port (often Docker Desktop). Set `ADMIN_PORT=3011`. |
 | **`.env` changes seem ignored** | A shell variable of the same name overrides it. Check `env \| grep WORKSPACE_PATH`. |
-| **`npm test` reports `spawn bash ENOENT`** | Inspect shell availability, command paths, and test logs. Do not delete `.mcp-state` indiscriminately: it may contain resumable tasks, coding loops, and transactions. |
+| **`pnpm test` reports `spawn bash ENOENT`** | Inspect shell availability, command paths, and test logs. Do not delete `.mcp-state` indiscriminately: it may contain resumable tasks, coding loops, and transactions. |
 | **Access denied** | Wrong path or OS permissions on that file. |
 | **git not found** | Install [Git](https://git-scm.com). |
 

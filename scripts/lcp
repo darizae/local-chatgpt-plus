@@ -128,7 +128,7 @@ require_tools() {
   [ -x "$LCP_TUNNEL_BIN" ] || die "tunnel-client not found at $LCP_TUNNEL_BIN (set LCP_TUNNEL_BIN)"
   [ -f "$LCP_TUNNEL_YAML" ] || die "tunnel profile not found at $LCP_TUNNEL_YAML"
   [ -d "$LCP_REPO" ] || die "repo not found at $LCP_REPO"
-  [ -f "$LCP_REPO/dist/index.js" ] || die "build missing: $LCP_REPO/dist/index.js (run: cd $LCP_REPO && npm run build)"
+  [ -f "$LCP_REPO/dist/index.js" ] || die "build missing: $LCP_REPO/dist/index.js (run: cd $LCP_REPO && pnpm run build)"
 }
 
 ensure_state_dirs() {

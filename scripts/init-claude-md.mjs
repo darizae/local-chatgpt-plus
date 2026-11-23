@@ -23,10 +23,12 @@ async function detectStack() {
     try {
       const pkg = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf-8"));
       const scripts = pkg.scripts || {};
-      if (scripts.dev) hints.push(`npm run dev`);
-      if (scripts.build) hints.push(`npm run build`);
-      if (scripts.test) hints.push(`npm test`);
-      if (scripts.lint) hints.push(`npm run lint`);
+      const manager = pkg.packageManager?.startsWith("pnpm@") || await exists(path.join(root, "pnpm-lock.yaml"))
+        ? "pnpm" : "npm";
+      if (scripts.dev) hints.push(`${manager} run dev`);
+      if (scripts.build) hints.push(`${manager} run build`);
+      if (scripts.test) hints.push(`${manager} test`);
+      if (scripts.lint) hints.push(`${manager} run lint`);
     } catch {}
     hints.push("Node.js project");
   }

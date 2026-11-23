@@ -78,10 +78,10 @@ async function captureBoot(label, mcpPort, adminPort) {
 
 await fs.mkdir(scratch, { recursive: true });
 
-console.log("Running npm test (pass 1)...");
-await runCommand("npm", ["test"], "npm-test-1.log");
-console.log("Running npm test (pass 2)...");
-await runCommand("npm", ["test"], "npm-test-2.log");
+console.log("Running pnpm test (pass 1)...");
+await runCommand("pnpm", ["test"], "pnpm-test-1.log");
+console.log("Running pnpm test (pass 2)...");
+await runCommand("pnpm", ["test"], "pnpm-test-2.log");
 
 const [mcpPort, adminPort] = await getFreePorts(2);
 
