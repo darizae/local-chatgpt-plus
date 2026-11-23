@@ -1,6 +1,6 @@
 # Local ChatGPT Plus — public release backlog
 
-**Last reviewed:** 2026-11-22. The original maintainer's private deployment logs and historical identifiers are intentionally not part of the public source history. This is the release-facing backlog; all checkboxes indicate evidence-based work remaining.
+**Last reviewed:** 2026-11-23. The original maintainer's private deployment logs and historical identifiers are intentionally not part of the public source history. This is the release-facing backlog; all checkboxes indicate evidence-based work remaining.
 
 ## Required before a public release
 
@@ -19,6 +19,10 @@
 - [ ] Turn on and validate the GitHub security CI/branch protections **for the intended new public repository only**; no automatic change to current private repository.
 - [ ] Confirm disclosure contacts, release version/tag and dependency support/ownership.
 - [ ] Decide a dedicated low-privilege OS account/VM isolation plan for untrusted projects. A `workspace` permission profile **does not sandbox shell subprocesses**.
+
+## Highest-priority connector compatibility blocker
+
+- [ ] **Deliver native MCP ImageContent to the ChatGPT model.** A view_image tool can produce valid PNG image blocks in native MCP tests while a connected tool adapter exposes only structured path/MIME/byte metadata, not pixels. The defect is not specific to one desktop or Linux runtime. Implement or coordinate connector-level preservation of image blocks and verify actual model-visible pixels through the hosted connector with a synthetic, recognizable multicolor fixture. A separate base64-read-and-forward workaround is **not** acceptance of view_image. Add regression coverage for image bytes, MIME types, file-size limits, authorization denial, and transport failures without publishing real screenshots, personal identifiers, or raw image artifacts.
 
 ## Follow-up engineering work
 
