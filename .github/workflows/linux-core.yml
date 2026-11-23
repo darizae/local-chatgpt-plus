@@ -1,0 +1,47 @@
+name: Linux core validation
+
+# Shared LCP core validation on Linux. No machine-specific configuration or
+# credentials. This complements, rather than replaces, macOS lifecycle tests.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout shared source
+        uses: actions/checkout@v4
+
+      - name: Set up pinned pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+
+      - name: Reproducible dependency installation
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared TypeScript core
+        run: pnpm run build
+
+      - name: Linux-compatible OAuth and runtime regression tests
+        run: pnpm run test:linux
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod
+
+      - name: Reject publication of sensitive tracked content
+        run: node scripts/check-publication-content.mjs
