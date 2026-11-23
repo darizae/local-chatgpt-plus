@@ -47,13 +47,16 @@ flowchart LR
 
 | Capability | What it enables |
 | --- | --- |
-| **Parallel agent orchestration** | Spawn and monitor local coding workers, select model providers, and keep task state across sessions. |
+| **Parallel agent orchestration** | Spawn and monitor coding workers with a configured external runner, select model providers, and keep task state across sessions. |
 | **Developer tooling** | Search and edit files, run commands and tests, use PTY/LSP tooling, inspect Git and create isolated worktrees. |
 | **Configurable execution** | Start in workspace or project-restricted application profiles; run a worker inside a separate OS-level sandbox or container when stronger isolation is required. |
 | **Layered access controls** | OAuth scopes for MCP, local permission policies, audit logging, a loopback-only Admin interface, and WebAuthn/Touch ID for Admin sign-in. |
+| **Credential and agent boundary hardening** | Optional AES-256-GCM encryption of upstream OAuth state, minimal inherited subagent environment, and neutralized untrusted upstream MCP tool metadata. |
 | **Self-hosted operations** | Run the MCP server and HTTPS tunnel under macOS `launchd`, with a local dashboard and documented agent-assisted setup. |
 
 **Sandboxing note:** A workspace profile or Git worktree is *not* an operating-system sandbox. Local shell tools run with their OS account's privileges. Use a separate restricted account, container, or VM for actual isolation, particularly with untrusted code. See [Security model](#security-model).
+
+**Encryption is opt-in:** Configure a protected `MCP_OAUTH_ENCRYPTION_KEY_FILE`; existing plaintext OAuth state requires an explicitly authorized migration. See [security hardening and rollout](docs/SECURITY_HARDENING_2026-11-23.md). Subagents require a separately installed/configured model runner; they do not reuse the ChatGPT subscription.
 
 ## ✦ Tech stack
 
