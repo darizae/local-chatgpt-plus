@@ -23,6 +23,14 @@ setfacl -m u:lcp-containers:--x /home/agent /home/agent/workspaces /home/agent/w
 for f in lcp-dev-docker.service lcp-dev-docker.socket lcp-dev-docker-proxy.service; do
   install -o root -g root -m 0644 "$src/$f" "/etc/systemd/system/$f"
 done
+# Rootless runc needs a persistent user manager and its session bus.
+uid="$(id -u lcp-containers)"
+loginctl enable-linger lcp-containers
+systemctl start "user@$uid.service"
+test -S "/run/user/$uid/bus"
+install -d -o root -g root -m 0755 /etc/systemd/system/lcp-dev-docker.service.d
+printf '[Unit]\nAfter=user@%s.service\nRequires=user@%s.service\n[Service]\nEnvironment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus\n' "$uid" "$uid" "$uid" > /etc/systemd/system/lcp-dev-docker.service.d/50-user-bus.conf
+chmod 0644 /etc/systemd/system/lcp-dev-docker.service.d/50-user-bus.conf
 systemctl daemon-reload
 systemd-analyze verify lcp-dev-docker.service lcp-dev-docker.socket lcp-dev-docker-proxy.service
 systemctl enable --now lcp-dev-docker.service lcp-dev-docker.socket
