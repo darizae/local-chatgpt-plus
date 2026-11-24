@@ -133,6 +133,8 @@ systemd-analyze verify "$queue" "$broker" "$socket" lcp-maintenance@.service lcp
 import pathlib,subprocess
 root=pathlib.Path("/home/agent/workspaces/projects")
 target=root/".lcp-cache/gitconfig"
+for directory in ("config","config/matplotlib","docker"):
+    (root/".lcp-cache"/directory).mkdir(parents=True, exist_ok=True, mode=0o700)
 repo=root/"local-chatgpt-plus"
 for k in ("user.name","user.email"):
     current=subprocess.run(["/usr/bin/git","config","--file",str(target),"--get",k],capture_output=True,text=True)
