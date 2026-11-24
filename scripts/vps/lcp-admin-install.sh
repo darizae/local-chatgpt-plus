@@ -100,7 +100,7 @@ rollback() {
 
 # Stop submissions, then verify no pending jobs before restarting the worker.
 systemctl stop "$broker"
-if !/usr/sbin/runuser -u agent -- /usr/bin/python3 -I -c '
+if ! /usr/sbin/runuser -u agent -- /usr/bin/python3 -I -c '
 import glob,json,sys
 for name in glob.glob("/home/agent/workspaces/tasks/*/state.json"):
     with open(name) as f: job=json.load(f)
