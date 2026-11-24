@@ -1,6 +1,8 @@
 #!/usr/bin/python3 -I
 """Private non-root GitHub push broker; per-repo SSH credentials never enter LCP."""
+import hashlib
 import json
+import tempfile
 import os
 from pathlib import Path
 import re
@@ -165,6 +167,93 @@ def inspect_outgoing(cwd, remote_refs):
                         blob.kill()
                         blob.wait()
 
+def lfs_transfer(cwd, remote, env, action, dry):
+    """Use a private, freshly initialized bare repo for LFS credential use.
+
+    Never run Git LFS with credentials in a caller-configured repository:
+    custom transfer agents, URL rewrites and .lfsconfig can execute code or
+    redirect authentication. Only committed HEAD and verified object bytes
+    enter the private transfer repo.
+    """
+    local_env = {k:v for k,v in env.items() if k != "GIT_SSH_COMMAND"}
+    local_env["GIT_ALLOW_PROTOCOL"] = "file"
+    with tempfile.TemporaryDirectory(prefix="lcp-lfs-") as directory:
+        tmp = Path(directory)
+        def checked(args, *, network=False, timeout=60):
+            result = git(tmp, *args, env=env if network else local_env, timeout=timeout)
+            if result.returncode:
+                raise ValueError("Git LFS "+args[0]+" failed; check repository access, LFS availability and quota")
+            return result.stdout
+        checked(["init", "--bare", "-b", "transfer"])
+        checked(["fetch", "--no-tags", "--no-recurse-submodules", "--depth=1",
+                 cwd.as_uri(), "HEAD:refs/heads/transfer"], timeout=300)
+        if git(tmp, "cat-file", "-e", "HEAD:.lfsconfig", env=local_env).returncode == 0:
+            raise ValueError("custom .lfsconfig requires separate trusted review")
+        checked(["config", "remote.origin.url", remote])
+        try:
+            files=json.loads(checked(["lfs", "ls-files", "--json", "HEAD"]))["files"]
+            if not isinstance(files,list): raise ValueError()
+        except (ValueError,KeyError,TypeError):
+            raise ValueError("Git LFS returned invalid object metadata") from None
+        if not files:
+            return {"ok":True,"message":"No LFS objects at committed HEAD","objects":0}
+        common=git(cwd,"rev-parse","--path-format=absolute","--git-common-dir")
+        if common.returncode:
+            raise ValueError("Cannot locate Git object storage")
+        common_dir=Path(common.stdout.strip()).resolve()
+        if not common_dir.is_relative_to(PROJECTS):
+            raise ValueError("LFS object storage outside workspace")
+        store=common_dir/"lfs"/"objects"
+        def object_path(root, oid):
+            if not isinstance(oid,str) or not re.fullmatch(r"[0-9a-f]{64}",oid):
+                raise ValueError("Invalid LFS object identity")
+            result=root/oid[:2]/oid[2:4]/oid
+            if result.resolve()!=result:
+                raise ValueError("Unexpected symlink in LFS object store")
+            return result
+        def copy_object(src,dst,oid,size,scan=False):
+            if not src.is_file():
+                raise ValueError("Missing LFS object; materialize it before upload")
+            dst.parent.mkdir(parents=True,exist_ok=True)
+            h=hashlib.sha256()
+            count=0
+            tail=b""
+            with tempfile.NamedTemporaryFile(dir=dst.parent,delete=False) as out:
+                path=Path(out.name)
+                try:
+                    with src.open("rb") as inp:
+                        for chunk in iter(lambda:inp.read(65536),b""):
+                            h.update(chunk); count+=len(chunk); out.write(chunk)
+                            if scan:
+                                scan_text("LFS asset",(tail+chunk).decode("latin-1"))
+                                tail=(tail+chunk)[-4096:]
+                    if h.hexdigest()!=oid or count!=size:
+                        raise ValueError("LFS object integrity check failed")
+                    out.flush()
+                    os.replace(path,dst)
+                finally:
+                    if path.exists(): path.unlink()
+        if action=="lfs-fetch":
+            if dry: raise ValueError("LFS fetch dry run not supported")
+            checked(["lfs","fetch","origin","HEAD"],network=True,timeout=480)
+        oids=set()
+        for f in files:
+            oid=f.get("oid"); size=f.get("size")
+            if not isinstance(size,int) or size<0: raise ValueError("Invalid LFS size")
+            source=object_path(store,oid)
+            private=object_path(tmp/"lfs"/"objects",oid)
+            if action=="lfs-fetch":
+                copy_object(private,source,oid,size)
+            else:
+                scan_path(f["name"])
+                copy_object(source,private,oid,size,scan=True)
+            oids.add(oid)
+        if action=="lfs-push":
+            args=["lfs","push","--object-id"]
+            if dry: args.append("--dry-run")
+            checked(args+["origin",*sorted(oids)],network=True,timeout=480)
+        return {"ok":True,"message":"Git LFS "+("download" if action=="lfs-fetch" else "upload preflight" if dry else "upload")+" completed","objects":len(oids)}
+
 def sync(req):
     cwd, repo, branch, owner, key_name = workspace(req.get("cwd"))
     if req.get("remote", "origin") != "origin":
@@ -191,6 +280,8 @@ def sync(req):
         "GIT_ALLOW_PROTOCOL":"ssh"
     }
     remote = "git@github.com:"+owner+"/"+repo+".git"
+    if action in ("lfs-fetch", "lfs-push"):
+        return lfs_transfer(cwd,remote,env,action,dry)
     if action == "fetch":
         if dry:
             raise ValueError("fetch dry run not supported")
@@ -242,7 +333,7 @@ def serve():
                     _, keys, account = policy()
                     answer={"ok":True,"message":"Git credential broker ready (all branches; account or repository credentials)",
                             "repo_credentials":len(keys),"account_credential_configured":account is not None}
-                elif req.get("action") in ("push", "fetch"):
+                elif req.get("action") in ("push", "fetch", "lfs-fetch", "lfs-push"):
                     answer=sync(req)
                 else:
                     raise ValueError("unsupported operation")
