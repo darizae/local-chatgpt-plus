@@ -1,0 +1,281 @@
+#!/usr/bin/python3 -I
+"""Private, bounded agent queue. No root access, no public server, no auto-push."""
+import argparse
+import datetime
+import stat
+from decimal import Decimal
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+HOME = Path("/home/agent")
+PROJECTS = HOME / "workspaces/projects"
+TASKS = HOME / "workspaces/tasks"
+WORKTREES = PROJECTS / ".lcp-worktrees"
+POLICY = Path("/etc/lcp-vps/agent-queue-policy.json")
+DEFAULT_POLICY = {"max_model_jobs_24h": 4, "max_reserved_cost_usd_24h": 2.0, "max_queued_jobs": 8}
+class QueueRejected(ValueError):
+    def __init__(self, code, retry_after_seconds=None):
+        self.code = code
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(code)
+
+def load_policy():
+    # The root-owned policy is intentionally independent of an editable checkout.
+    try:
+        with POLICY.open() as f:
+            info = os.fstat(f.fileno())
+            parent = POLICY.parent.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+                    or parent.st_uid != 0 or parent.st_mode & 0o022 or not stat.S_ISDIR(parent.st_mode)
+                    or POLICY.is_symlink()):
+                raise QueueRejected("policy_invalid")
+            data = json.load(f)
+    except FileNotFoundError:
+        return DEFAULT_POLICY.copy()
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, QueueRejected):
+            raise
+        raise QueueRejected("policy_invalid") from exc
+    if not isinstance(data, dict) or set(data) != set(DEFAULT_POLICY):
+        raise QueueRejected("policy_invalid")
+    count, budget, queued = (data[k] for k in DEFAULT_POLICY)
+    if (type(count) is not int or not 1 <= count <= 100 or
+            type(budget) not in (int, float) or not 0.01 <= budget <= 10 or
+            type(queued) is not int or not 1 <= queued <= 32):
+        raise QueueRejected("policy_invalid")
+    return data
+
+def capacity(records, policy, now=None):
+    now = time.time() if now is None else now
+    recent = sorted([x for x in records if x["engine"].startswith("omp")
+                     and now - x["created"] < 86400], key=lambda x: x["created"])
+    active = sum(x["state"] in ("queued", "running") for x in records)
+    reserved = sum((Decimal(str(x["max_cost_usd"])) for x in recent), Decimal(0))
+    return {
+        "active_jobs": active, "model_jobs_24h": len(recent),
+        "reserved_cost_usd_24h": float(reserved),
+        "max_model_jobs_24h": policy["max_model_jobs_24h"],
+        "max_reserved_cost_usd_24h": policy["max_reserved_cost_usd_24h"],
+        "max_queued_jobs": policy["max_queued_jobs"],
+        "next_model_slot_in_seconds": max(0, int(recent[0]["created"] + 86400 - now) + 1) if recent else 0,
+    }
+
+def check_capacity(records, policy, engine, cost, now=None):
+    state = capacity(records, policy, now)
+    if state["active_jobs"] >= policy["max_queued_jobs"]:
+        raise QueueRejected("queue_full")
+    if not engine.startswith("omp"):
+        return
+    if state["model_jobs_24h"] >= policy["max_model_jobs_24h"]:
+        raise QueueRejected("daily_job_limit", state["next_model_slot_in_seconds"])
+    if Decimal(str(state["reserved_cost_usd_24h"])) + Decimal(str(cost)) > Decimal(str(policy["max_reserved_cost_usd_24h"])):
+        raise QueueRejected("daily_cost_limit", state["next_model_slot_in_seconds"])
+MAX_SECONDS = 600
+MAX_COST = 0.50
+ALLOWED_ENGINES = ("omp", "omp-readonly", "selftest")
+LOCK = TASKS / ".lock"
+
+def load(job_id):
+    if not (len(job_id) == 32 and all(x in "0123456789abcdef" for x in job_id)):
+        raise ValueError("invalid job id")
+    return json.loads((TASKS / job_id / "state.json").read_text())
+
+def atomic_state(job):
+    directory = TASKS / job["id"]
+    tmp = directory / ".state.next"
+    tmp.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, directory / "state.json")
+
+def all_jobs():
+    records = []
+    for p in TASKS.iterdir():
+        if p.is_symlink() or not p.is_dir() or len(p.name) != 32:
+            continue
+        try:
+            records.append(load(p.name))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return sorted(records, key=lambda item: item["created"], reverse=True)
+
+def git(*args, cwd):
+    return subprocess.run(["/usr/bin/git", "-C", str(cwd), *args],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, timeout=20, check=False)
+
+def submit(a):
+    if a.engine not in ALLOWED_ENGINES:
+        raise ValueError("invalid engine")
+    if not (10 <= a.seconds <= MAX_SECONDS) or not (0.01 <= a.cost <= MAX_COST):
+        raise ValueError("job runtime or cost exceeds configured limits")
+    repo = PROJECTS / a.repo
+    if not a.repo or Path(a.repo).name != a.repo or a.repo.startswith(".") or repo.is_symlink():
+        raise ValueError("invalid repository")
+    if not repo.is_dir() or not (repo / ".git").exists():
+        raise QueueRejected("repository_missing")
+    status = git("status", "--porcelain", cwd=repo)
+    if status.returncode != 0:
+        raise QueueRejected("repository_missing")
+    if status.stdout.strip():
+        raise QueueRejected("repository_dirty")
+    prompt = sys.stdin.read(10001)
+    if a.engine in ("omp", "omp-readonly") and (not prompt.strip() or len(prompt) > 10000):
+        raise ValueError("prompt required, max 10000 characters")
+    if a.engine == "selftest":
+        prompt = "internal non-networked queue smoke test"
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = all_jobs()
+        check_capacity(previous, load_policy(), a.engine, a.cost)
+        job_id = uuid.uuid4().hex
+        directory = TASKS / job_id
+        directory.mkdir(mode=0o700)
+        (directory / "prompt.txt").write_text(prompt)
+        (directory / "prompt.txt").chmod(0o600)
+        state = {"id": job_id, "repo": a.repo, "engine": a.engine,
+                 "seconds": a.seconds, "max_cost_usd": a.cost, "state": "queued",
+                 "created": time.time(), "finished": None,
+                 "worktree": None, "error": None}
+        atomic_state(state)
+    print(json.dumps({"id": job_id, "state": "queued", "repo": a.repo,
+                      "max_cost_usd": a.cost, "seconds": a.seconds}))
+
+def terminate_owned(child):
+    if child.poll() is None:
+        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)
+
+def execute(job):
+    path = TASKS / job["id"]
+    repo = PROJECTS / job["repo"]
+    if not repo.is_dir() or repo.is_symlink() or not (repo / ".git").exists():
+        job.update(state="failed", error="repository missing", finished=time.time())
+        atomic_state(job)
+        return
+    worktree = None
+    if job["engine"] in ("omp", "omp-readonly"):
+        worktree = WORKTREES / job["repo"] / job["id"]
+        worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        branch = "job/" + job["id"]
+        added = git("worktree", "add", "-b", branch, str(worktree), "HEAD", cwd=repo)
+        if added.returncode:
+            job.update(state="failed", error="could not create isolated Git worktree", finished=time.time())
+            atomic_state(job)
+            return
+    job.update(state="running", started=time.time(),
+               worktree=str(worktree) if worktree else None)
+    atomic_state(job)
+    if job["engine"] == "selftest":
+        if job["seconds"] >= 30:
+            command = ["/usr/bin/python3", "-c", "import time; print('LCP_QUEUE_SELFTEST_OK', flush=True); time.sleep(25)"]
+        else:
+            command = ["/usr/bin/python3", "-c", "print('LCP_QUEUE_SELFTEST_OK')"]
+        cwd = repo
+    else:
+        command = [
+            "/home/agent/.local/bin/omp", "run",
+            "--cwd=" + str(worktree), "-p", "--no-session",
+            "--model=saia/qwen3-coder-next", "--mode=json",
+            *(["--no-tools", "--no-extensions", "--no-skills", "--no-context-files", "--no-rules"]
+              if job["engine"] == "omp-readonly" else []),
+            "--max-time=" + str(job["seconds"]),
+            "--max-cost=" + str(job["max_cost_usd"]),
+            (path / "prompt.txt").read_text()
+        ]
+        cwd = worktree
+    with (path / "output.log").open("a") as out:
+        child = subprocess.Popen(command, cwd=str(cwd), stdout=out,
+                                 stderr=subprocess.STDOUT, start_new_session=True,
+                                 stdin=subprocess.DEVNULL,
+                                 env={**os.environ, "HOME": str(HOME),
+                                      "PATH": "/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin"})
+        stopped = None
+        deadline = time.monotonic() + job["seconds"] + 10
+        while child.poll() is None:
+            if (path / "cancel").exists():
+                stopped = "cancelled"
+                terminate_owned(child)
+                break
+            if time.monotonic() > deadline:
+                stopped = "timed_out"
+                terminate_owned(child)
+                break
+            time.sleep(1)
+        job.update(state=stopped or ("completed" if child.returncode == 0 else "failed"),
+                   exit_code=child.returncode,
+                   error=stopped or (None if child.returncode == 0 else "worker exited nonzero"),
+                   finished=time.time())
+        atomic_state(job)
+
+def daemon():
+    for job in all_jobs():
+        if job["state"] == "running":
+            job.update(state="interrupted", error="worker restarted before completion", finished=time.time())
+            atomic_state(job)
+    print("LCP_AGENT_QUEUE_RUNNING max_parallel=1 policy=operator-configured", flush=True)
+    while True:
+        queued = [x for x in all_jobs() if x["state"] == "queued"]
+        for job in reversed(queued[:1]):
+            if (TASKS / job["id"] / "cancel").exists():
+                job.update(state="cancelled", finished=time.time())
+                atomic_state(job)
+                continue
+            execute(job)
+        time.sleep(2)
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="op", required=True)
+    s = sub.add_parser("submit")
+    s.add_argument("--repo", required=True)
+    s.add_argument("--engine", choices=ALLOWED_ENGINES, default="omp")
+    s.add_argument("--seconds", type=int, default=180)
+    s.add_argument("--cost", type=float, default=0.25)
+    for cmd in ("status", "cancel", "logs"):
+        sub.add_parser(cmd).add_argument("id")
+    sub.add_parser("list")
+    sub.add_parser("capacity")
+    sub.add_parser("daemon")
+    a = parser.parse_args()
+    try:
+        if a.op == "submit":
+            submit(a)
+        elif a.op == "daemon":
+            daemon()
+        elif a.op == "capacity":
+            print(json.dumps(capacity(all_jobs(), load_policy())))
+        elif a.op == "list":
+            print(json.dumps([{k: x.get(k) for k in
+                  ("id", "repo", "engine", "state", "created", "finished", "max_cost_usd")}
+                  for x in all_jobs()[:30]], indent=2))
+        elif a.op == "status":
+            print(json.dumps(load(a.id), indent=2))
+        elif a.op == "cancel":
+            job = load(a.id)
+            (TASKS / a.id / "cancel").touch()
+            print(json.dumps({"id": a.id, "cancellation_requested": True,
+                              "current_state": job["state"]}))
+        elif a.op == "logs":
+            log = TASKS / a.id / "output.log"
+            if log.exists():
+                print(log.read_text(errors="replace")[-8000:])
+    except QueueRejected as e:
+        print(json.dumps({"code": e.code, "retry_after_seconds": e.retry_after_seconds}))
+        raise SystemExit(2)
+    except (OSError, ValueError) as e:
+        print("queue: " + str(e), file=sys.stderr)
+        raise SystemExit(2)
+
+if __name__ == "__main__":
+    main()

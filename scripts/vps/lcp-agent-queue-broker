@@ -1,0 +1,165 @@
+#!/usr/bin/python3 -I
+"""Local-only, capped interface to the already-isolated lcp-agent-queue daemon."""
+import json
+import math
+import os
+import pathlib
+import re
+import socket
+import socketserver
+import struct
+import subprocess
+
+SOCKET = '/run/lcp-agent-broker/agent.sock'
+QUEUE = '/usr/local/libexec/lcp-agent-queue'
+TASKS = pathlib.Path('/home/agent/workspaces/tasks')
+ENV = {'PATH': '/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin',
+       'HOME': '/home/agent', 'LANG': 'C.UTF-8'}
+MAX_WIRE_BYTES = 14_000
+HEX_ID = re.compile(r'[0-9a-f]{32}\Z')
+REPO = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}\Z')
+
+
+SAFE_CODES = {
+    'daily_job_limit': 'Rolling 24-hour model-job limit reached',
+    'daily_cost_limit': 'Rolling 24-hour reserved model-cost limit reached',
+    'queue_full': 'Agent queue is full',
+    'repository_dirty': 'Commit or stash changes before creating an isolated worktree',
+    'policy_invalid': 'Queue policy is invalid; administrator review required',
+    'repository_missing': 'Requested repository is unavailable',
+    'queue_rejected': 'Queue rejected request; check queue health',
+}
+
+class QueueRejected(ValueError):
+    def __init__(self, code, retry=None):
+        self.code = code if isinstance(code, str) and code in SAFE_CODES else 'queue_rejected'
+        self.retry = retry if type(retry) is int and 0 <= retry <= 86401 else None
+        super().__init__(SAFE_CODES[self.code])
+
+def queue_call(args, prompt=None):
+    outcome = subprocess.run([QUEUE, *args], input=prompt, text=True,
+                             capture_output=True, timeout=12, env=ENV,
+                             cwd='/home/agent/workspaces/projects', check=False)
+    if outcome.returncode != 0:
+        # Only structured, allowlisted reasons are reflected; never raw stderr.
+        try:
+            result = json.loads(outcome.stdout)
+            if isinstance(result, dict):
+                raise QueueRejected(result.get('code'), result.get('retry_after_seconds'))
+        except json.JSONDecodeError:
+            pass
+        raise QueueRejected('queue_rejected')
+    return outcome.stdout
+
+
+def dispatch(req):
+    if not isinstance(req, dict):
+        raise ValueError('Request must be an object')
+    op = req.get('action')
+    if op == 'capacity':
+        if set(req) != {'action'}:
+            raise ValueError('Unexpected capacity parameters')
+        result = json.loads(queue_call(['capacity']))
+        fields = ('active_jobs', 'model_jobs_24h', 'reserved_cost_usd_24h',
+                  'max_model_jobs_24h', 'max_reserved_cost_usd_24h', 'max_queued_jobs',
+                  'next_model_slot_in_seconds')
+        values = {key: result[key] for key in fields}
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in values.values()):
+            raise ValueError('Invalid capacity response')
+        return {'ok': True, **values}
+    if op == 'submit':
+        repo, prompt = req.get('repo'), req.get('prompt')
+        engine = req.get('engine', 'omp')
+        seconds, cost = req.get('seconds', 90), req.get('cost', 0.05)
+        if not isinstance(repo, str) or not REPO.fullmatch(repo) or repo.startswith('.'):
+            raise ValueError('Invalid repository name')
+        if not isinstance(prompt, str) or not 1 <= len(prompt) <= 6_000 or '\x00' in prompt:
+            raise ValueError('Prompt must be 1..6000 characters')
+        if engine not in ('omp', 'omp-readonly', 'selftest'):
+            raise ValueError('Unsupported engine')
+        if type(seconds) is not int or not 10 <= seconds <= 120:
+            raise ValueError('Seconds must be 10..120')
+        if isinstance(cost, bool) or not isinstance(cost, (float, int)) or not 0.01 <= cost <= 0.05:
+            raise ValueError('Per-job cost cap must be $0.01..$0.05')
+        args = ['submit', '--repo', repo, '--engine', engine, '--seconds', str(seconds),
+                '--cost', str(cost)]
+        submitted = json.loads(queue_call(args, prompt))
+        return {'ok': True, 'id': submitted['id'], 'state': submitted['state'],
+                'repo': repo, 'engine': engine, 'max_cost_usd': cost, 'seconds': seconds}
+    job_id = req.get('id')
+    if not isinstance(job_id, str) or not HEX_ID.fullmatch(job_id):
+        raise ValueError('Invalid job identifier')
+    if op == 'status':
+        item = json.loads(queue_call(['status', job_id]))
+        return {'ok': True, 'id': job_id, 'state': item.get('state'),
+                'exit_code': item.get('exit_code'), 'max_cost_usd': item.get('max_cost_usd')}
+    if op == 'cancel':
+        item = json.loads(queue_call(['cancel', job_id]))
+        return {'ok': True, 'id': job_id, 'cancellation_requested': item.get('cancellation_requested')}
+    if op == 'result':
+        item = json.loads(queue_call(['status', job_id]))
+        if item.get('state') in ('queued', 'running'):
+            return {'ok': True, 'id': job_id, 'state': item.get('state'), 'result': None}
+        path = TASKS / job_id / 'output.log'
+        if not path.is_file() or path.is_symlink():
+            return {'ok': True, 'id': job_id, 'state': item.get('state'), 'result': None}
+        # The queue's output is lower-trust model content, not authorization.
+        last = None
+        with path.open('rb') as output:
+            output.seek(0, 2)
+            output.seek(max(0, output.tell() - 250_000))
+            tail = output.read(250_000).decode('utf-8', errors='replace')
+        for line in tail.splitlines():
+            try:
+                event = json.loads(line)
+                if event.get('type') != 'message_end':
+                    continue
+                message = event.get('message') or {}
+                if message.get('role') != 'assistant':
+                    continue
+                blocks = message.get('content') or []
+                value = '\n'.join(block.get('text', '') for block in blocks
+                                  if isinstance(block, dict) and block.get('type') == 'text')
+                if value.strip():
+                    last = value[:2_000]
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return {'ok': True, 'id': job_id, 'state': item.get('state'),
+                'untrusted_model_output': last}
+    raise ValueError('Unknown action')
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.request.settimeout(7)
+        try:
+            creds = self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            pid, uid, gid = struct.unpack('3i', creds)
+            if uid != os.getuid():
+                raise ValueError('Unauthorized Unix socket peer')
+            line = self.rfile.readline(MAX_WIRE_BYTES + 1)
+            if not line.endswith(b'\n') or len(line) > MAX_WIRE_BYTES:
+                raise ValueError('Request is too long or incomplete')
+            response = dispatch(json.loads(line))
+        except QueueRejected as ex:
+            response = {'ok': False, 'code': ex.code, 'error': SAFE_CODES[ex.code],
+                        'retry_after_seconds': ex.retry}
+        except (ValueError, TypeError, OSError, KeyError, json.JSONDecodeError, subprocess.TimeoutExpired):
+            response = {'ok': False, 'code': 'invalid_or_unavailable',
+                        'error': 'Invalid request or broker dependency unavailable'}
+        self.wfile.write((json.dumps(response, ensure_ascii=True) + '\n').encode())
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = False
+
+
+if __name__ == '__main__':
+    path = pathlib.Path(SOCKET)
+    if path.exists() or path.is_symlink():
+        raise SystemExit('Refusing to replace an existing socket path')
+    with Server(SOCKET, Handler) as server:
+        os.chmod(SOCKET, 0o600)
+        print('Bounded agent queue broker ready (Unix socket, same-UID only)', flush=True)
+        server.serve_forever(poll_interval=0.5)

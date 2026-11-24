@@ -15,33 +15,19 @@ On 2026-11-24 the tunnel started before port 8766 was listening. Its startup cat
 
 ## Migration (operator only)
 
-The connector account is deliberately not the host administrator. The root-owned controller, helper and drop-ins require an authorized root shell or provider console, not a coding subagent. Review all changed files and the commit before running the installer; never execute an unreviewed agent-writable checkout as root. Compile the intended commit as the unprivileged agent first, e.g. from the repository:
+The connector account is deliberately not the host administrator. The root-owned controller, helper and drop-ins require a one-time authorized host bootstrap. Follow [Linux VPS self-service operations](LINUX_VPS_OPERATIONS.md) to install the reviewed root-owned maintenance bridge together with the reliability fix. Compile the intended commit as the unprivileged agent first, e.g. from the repository:
 
 ```bash
-./node_modules/.bin/tsc
-python3 scripts/test-lcp-vps-health.py
-node scripts/test-dashboard-tunnel-status.mjs
+npm run test:vps
+# Commit the reviewed changes first.
+npm run build:vps
 git status --short
 git rev-parse --short=12 HEAD
 ```
 
 Stop or finish unrelated VPS work before the restart. The installer validates existing unit names, account, startup command shape, and drop-in ownership assumptions, makes a root-only backup, installs the reviewed artifacts as root-owned files, verifies systemd configuration, stops the old service cgroups, and starts only services that had been active. It preserves boot enablement and the phone's forced-command wrapper. The original tunnel command is read from the existing root-owned unit; it is not embedded in source control. It rolls back installed service files and restores the previous active state if migration fails (the compiled application remains the newly built version).
 
-From an authorized administrator shell, in the reviewed VPS checkout:
-
-```bash
-sudo bash scripts/lcp-vps-install.sh
-```
-
-To decouple migration itself from the SSH session, the administrator can instead start a transient service with the absolute path to the reviewed installer:
-
-```bash
-sudo systemd-run --unit=lcp-vps-reliability-migration --wait --collect \
-  --property=Type=oneshot --property=TimeoutStartSec=900 \
-  /usr/bin/bash /home/agent/workspaces/projects/local-chatgpt-plus/scripts/lcp-vps-install.sh
-```
-
-Do not install using both commands. If migration fails, inspect the reported backup location and journal from the administrator console; rollback may need manual intervention if the old startup race reappears. Keep the existing SSH/console recovery channel accessible.
+Use the combined administrator bootstrap in [Linux VPS self-service operations](LINUX_VPS_OPERATIONS.md). It invokes the reliability installer from the reviewed root-owned snapshot. If migration fails, inspect the reported backup location and journal from the administrator console; rollback may need manual intervention if the old startup race reappears. Keep the existing SSH/console recovery channel accessible.
 
 ## Acceptance checks (after installation)
 

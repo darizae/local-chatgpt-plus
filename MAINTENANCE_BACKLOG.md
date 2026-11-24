@@ -24,6 +24,14 @@
 
 - [ ] **Deliver native MCP ImageContent to the ChatGPT model.** A view_image tool can produce valid PNG image blocks in native MCP tests while a connected tool adapter exposes only structured path/MIME/byte metadata, not pixels. The defect is not specific to one desktop or Linux runtime. Implement or coordinate connector-level preservation of image blocks and verify actual model-visible pixels through the hosted connector with a synthetic, recognizable multicolor fixture. A separate base64-read-and-forward workaround is **not** acceptance of view_image. Add regression coverage for image bytes, MIME types, file-size limits, authorization denial, and transport failures without publishing real screenshots, personal identifiers, or raw image artifacts.
 
+## VPS self-service operations
+
+- [x] Reproduce rolling SAIA quota exhaustion and implement typed, allowlisted broker diagnostics, capacity query and an administrator-configurable job/cost policy.
+- [x] Implement a socket-activated fixed-operation maintenance bridge and compiled artifact identity checks, with hermetic tests; no general root execution.
+- [ ] Complete one-time authorized host bootstrap of the tunnel reliability drop-ins, root-owned queue/broker artifacts, explicit quota policy and maintenance socket. Verify actual SAIA model execution, a fresh MCP tool call after restart, PIDs, artifact commit and phone disconnect.
+- [ ] Verify the isolated model queue cannot reach the maintenance socket and the restart broker rejects extra operations under the live systemd sandbox.
+- [ ] Add approved/signed release handling for updates to privileged host components themselves, so normal application deployments remain self-service without giving the MCP runtime general root authority.
+
 ## Follow-up engineering work
 
 - [x] Add opt-in versioned authenticated encryption for upstream OAuth state, key-file permission enforcement and explicit legacy migration consent; synthetic wrong-key/tamper and plaintext canary tests.

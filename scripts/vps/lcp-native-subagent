@@ -1,0 +1,115 @@
+#!/usr/bin/python3 -I
+"""Root-owned LCP subagent launcher: ONLY the local bounded agent-queue broker."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import sys
+import time
+
+SOCKET = '/run/lcp-agent-broker/agent.sock'
+ROOT = Path('/home/agent/workspaces/projects')
+REPO = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z')
+JOB = re.compile(r'[0-9a-f]{32}\Z')
+active_id = None
+
+
+def ask(request):
+    raw = (json.dumps(request, ensure_ascii=True) + '\n').encode('utf-8')
+    if len(raw) > 14_000:
+        raise ValueError('Broker request exceeds permitted size')
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(8)
+        s.connect(SOCKET)
+        s.sendall(raw)
+        with s.makefile('rb') as stream:
+            result = stream.readline(16000)
+    if not result or len(result) >= 16000:
+        raise ValueError('Broker sent no bounded response')
+    data = json.loads(result)
+    if not isinstance(data, dict) or data.get('ok') is not True:
+        reasons = {
+            'daily_job_limit': 'Rolling 24-hour SAIA job quota exhausted',
+            'daily_cost_limit': 'Rolling 24-hour reserved SAIA cost budget exhausted',
+            'queue_full': 'SAIA queue full',
+            'repository_dirty': 'Repository must be clean; commit or stash changes first',
+            'repository_missing': 'Repository unavailable',
+            'policy_invalid': 'Queue policy invalid; administrator review required',
+            'queue_rejected': 'Queue rejected request; inspect queue capacity',
+        }
+        code = data.get('code') if isinstance(data, dict) else None
+        message = reasons.get(code, 'Broker rejected request (unclassified)') if isinstance(code, str) else 'Broker rejected request (unclassified)'
+        retry = data.get('retry_after_seconds') if isinstance(data, dict) else None
+        if type(retry) is int and 0 <= retry <= 86401:
+            message += '; earliest quota release in ' + str(retry) + ' seconds'
+        raise ValueError(message)
+    return data
+
+
+def stop(_sig, _frame):
+    if active_id:
+        try:
+            ask({'action': 'cancel', 'id': active_id})
+        except Exception:
+            pass
+    raise SystemExit(130)
+
+
+def main():
+    global active_id
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--capacity', action='store_true', help='Read bounded queue capacity without submitting a job')
+    parser.add_argument('--engine', choices=['omp', 'omp-readonly'], default='omp-readonly')
+    parser.add_argument('--seconds', type=int, default=90)
+    parser.add_argument('--cost', type=float, default=0.05)
+    args = parser.parse_args()
+    if args.capacity:
+        print(json.dumps(ask({'action': 'capacity'})))
+        return 0
+    if not 10 <= args.seconds <= 120 or not 0.01 <= args.cost <= 0.05:
+        parser.error('Hard bounded duration/cost limits exceeded')
+    directory = Path.cwd().resolve()
+    try:
+        relative = directory.relative_to(ROOT)
+    except ValueError:
+        parser.error('Working directory outside authorized project root')
+    if len(relative.parts) != 1 or not REPO.fullmatch(relative.parts[0]) or relative.parts[0].startswith('.'):
+        parser.error('Expected a direct, named Git repository under project root')
+    repo = relative.parts[0]
+    prompt = sys.stdin.read(6002)
+    if not 1 <= len(prompt) <= 6000 or not prompt.strip():
+        parser.error('Prompt must be nonempty, at most 6000 characters')
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    receipt = ask({'action': 'submit', 'repo': repo, 'prompt': prompt,
+                   'seconds': args.seconds, 'cost': args.cost, 'engine': args.engine})
+    active_id = receipt.get('id')
+    if not isinstance(active_id, str) or not JOB.fullmatch(active_id):
+        raise ValueError('Invalid broker job receipt')
+    deadline = time.monotonic() + args.seconds + 20
+    while time.monotonic() < deadline:
+        state = ask({'action': 'status', 'id': active_id})
+        if state.get('state') not in ('queued', 'running'):
+            output = ask({'action': 'result', 'id': active_id})
+            candidate = output.get('untrusted_model_output')
+            if isinstance(candidate, str):
+                print(candidate[:2000], flush=True)
+            if state.get('state') == 'completed' and state.get('exit_code') == 0:
+                print('BOUNDED_SUBAGENT_COMPLETED', flush=True)
+                return 0
+            print('Bounded subagent job did not complete successfully', file=sys.stderr)
+            return 1
+        time.sleep(1.5)
+    ask({'action': 'cancel', 'id': active_id})
+    raise TimeoutError('Bounded subagent exceeded deadline; cancellation requested')
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, TimeoutError, json.JSONDecodeError) as exc:
+        print('Bounded subagent launcher error: ' + str(exc)[:160], file=sys.stderr)
+        raise SystemExit(1)
