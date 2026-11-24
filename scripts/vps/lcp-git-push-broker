@@ -192,6 +192,7 @@ def lfs_transfer(cwd, remote, env, action, dry):
         checked(["config", "remote.origin.url", remote])
         try:
             files=json.loads(checked(["lfs", "ls-files", "--json", "HEAD"]))["files"]
+            if files is None: files=[]
             if not isinstance(files,list): raise ValueError()
         except (ValueError,KeyError,TypeError):
             raise ValueError("Git LFS returned invalid object metadata") from None
