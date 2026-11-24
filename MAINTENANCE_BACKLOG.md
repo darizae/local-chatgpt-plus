@@ -26,11 +26,25 @@
 
 ## VPS self-service operations
 
-- [x] Reproduce rolling SAIA quota exhaustion and implement typed, allowlisted broker diagnostics, capacity query and an administrator-configurable job/cost policy.
+- [x] Reproduce rolling SAIA quota exhaustion; remove both rolling admission quotas (including legacy policy fields), raise per-job cost/runtime, improve result/prompt capacity, allow dirty parent checkouts with pinned committed baseline and keep typed diagnostics.
 - [x] Implement a socket-activated fixed-operation maintenance bridge and compiled artifact identity checks, with hermetic tests; no general root execution.
-- [ ] Complete one-time authorized host bootstrap of the tunnel reliability drop-ins, root-owned queue/broker artifacts, explicit quota policy and maintenance socket. Verify actual SAIA model execution, a fresh MCP tool call after restart, PIDs, artifact commit and phone disconnect.
+- [ ] Complete one-time authorized host bootstrap of the tunnel reliability drop-ins, root-owned queue/broker artifacts, quota-free SAIA queue, updated native launcher profile, writable workspace caches and maintenance socket. Verify actual SAIA model execution, a fresh MCP tool call after restart, PIDs, artifact commit and phone disconnect.
 - [ ] Verify the isolated model queue cannot reach the maintenance socket and the restart broker rejects extra operations under the live systemd sandbox.
 - [ ] Add approved/signed release handling for updates to privileged host components themselves, so normal application deployments remain self-service without giving the MCP runtime general root authority.
+
+## VPS repository development friction audit
+
+- [x] Redirect npm/pnpm/pip/uv/browser caches into a writable workspace-local directory in the reviewed migration. Live install still pending.
+- [ ] Verify fresh installs with npm, pnpm and uv/pip inside the real service; provision a pinned pnpm executable (not currently on the MCP PATH) and browser runtime/dependencies.
+- [ ] Make Git identity setup and repo onboarding routine: standard commits currently require an identity, private fetch/clone may need scoped credentials, and push broker only accepts pre-registered origin/feature branches. Preserve protected branch/secret checks; add an owner-approved repo registration/PR workflow.
+- [ ] Add isolated rootless container/build/test capability for Docker/Compose workflows; access to the existing rootful Docker socket is denied. Do not grant arbitrary host-root-equivalent Docker access.
+- [ ] Measure and tune MCP/worker cgroup resource ceilings (MCP 640 MiB RAM, one CPU, 128 tasks; worker 1.5 GiB RAM, one CPU, 128 tasks); distinguish memory/CPU exhaustion from application errors and avoid imposing arbitrary limits on normal repo builds.
+- [ ] Provide structured, scoped alternatives for blocked interactive PTY/REPL/browser tools and ordinary cleanup commands; raw command-text deny regexes produce false positives and unrestricted runtimes are disabled. Keep the actual OS boundary and credential isolation intact.
+- [ ] Add durable detached build/deploy jobs across MCP restarts, richer broker status/resume for model jobs, and a provider-credential-isolated private Git fetch path. The MCP connection and host-side runtime remain different failure domains.
+- [ ] Validate arbitrary registered project layouts (nested repositories and worktrees), explicit uncommitted-change snapshots, bounded parallel workers and complete model artifact retrieval; native queue currently accepts direct named repositories and uses committed HEAD only.
+- [ ] Audit current host privileges with the authorized operator, then implement reusable, scoped maintenance operations for routine service/container/package setup instead of repeated manual intervention.
+
+See [VPS repository development audit](docs/VPS_DEV_FRICTION.md) for measured live evidence and priorities.
 
 ## Follow-up engineering work
 

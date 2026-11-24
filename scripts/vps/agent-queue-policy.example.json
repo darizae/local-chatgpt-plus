@@ -1,5 +1,3 @@
 {
-  "max_model_jobs_24h": 20,
-  "max_reserved_cost_usd_24h": 1,
-  "max_queued_jobs": 8
+  "max_queued_jobs": 32
 }

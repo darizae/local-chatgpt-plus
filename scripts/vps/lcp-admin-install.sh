@@ -88,6 +88,9 @@ done
 systemd-tmpfiles --create /etc/tmpfiles.d/lcp-maintenance.conf
 systemctl daemon-reload
 systemd-analyze verify "$queue" "$broker" "$socket" lcp-maintenance@.service
+# Keep package installs and browser downloads inside the existing writable
+# workspace. Creating these directories as agent avoids root-owned caches.
+/usr/sbin/runuser -u agent -- /usr/bin/mkdir -p /home/agent/workspaces/projects/.lcp-cache
 # Install the previous tunnel-readiness migration first. Its own rollback is separate.
 bash "$src/../lcp-vps-install.sh"
 systemctl enable --now "$socket"
@@ -96,4 +99,23 @@ if [[ "$broker_on" == active ]]; then systemctl start "$broker"; fi
 /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-maintenance-client status
 if [[ "$broker_on" == active ]]; then /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-agent-queue-client capacity; fi
 trap - EXIT INT TERM
+# Configure the ordinary user's native launcher only after the new host broker
+# is available. The user-owned profile is written as agent, never as root.
+# Preserve other profile keys, but replace the obsolete bounded runner settings.
+if [[ "$broker_on" == active ]]; then
+  /usr/sbin/runuser -u agent -- /usr/bin/python3 -I -c '
+import json, os, pathlib, tempfile
+path = pathlib.Path("/home/agent/workspaces/projects/local-chatgpt-plus/profiles/subagents.json")
+value = json.loads(path.read_text()) if path.exists() else {"version": 1}
+value.update(enabled=True, executable="/usr/local/bin/lcp-native-subagent",
+    args=["--engine","omp","--seconds","900","--cost","1.0"],
+    prompt_via_stdin=True, timeout_ms=10800000, max_concurrency=4, isolation="none")
+with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as f:
+    json.dump(value, f, indent=2)
+    f.write("\n")
+    name = f.name
+os.replace(name, path)
+print("Native runner configured: $1/job, 900 seconds, four submission slots")
+'
+fi
 echo 'Host bootstrap complete. Routine application restart now uses the fixed maintenance socket.'

@@ -20,7 +20,9 @@ PROJECTS = HOME / "workspaces/projects"
 TASKS = HOME / "workspaces/tasks"
 WORKTREES = PROJECTS / ".lcp-worktrees"
 POLICY = Path("/etc/lcp-vps/agent-queue-policy.json")
-DEFAULT_POLICY = {"max_model_jobs_24h": 4, "max_reserved_cost_usd_24h": 2.0, "max_queued_jobs": 8}
+DEFAULT_POLICY = {"max_queued_jobs": 32}
+MAX_SECONDS = 1800
+MAX_COST = 5.00
 class QueueRejected(ValueError):
     def __init__(self, code, retry_after_seconds=None):
         self.code = code
@@ -44,14 +46,14 @@ def load_policy():
         if isinstance(exc, QueueRejected):
             raise
         raise QueueRejected("policy_invalid") from exc
-    if not isinstance(data, dict) or set(data) != set(DEFAULT_POLICY):
+    if not isinstance(data, dict) or set(data) - {"max_queued_jobs", "max_model_jobs_24h", "max_reserved_cost_usd_24h"}:
         raise QueueRejected("policy_invalid")
-    count, budget, queued = (data[k] for k in DEFAULT_POLICY)
-    if (type(count) is not int or not 1 <= count <= 100 or
-            type(budget) not in (int, float) or not 0.01 <= budget <= 10 or
-            type(queued) is not int or not 1 <= queued <= 32):
+    # Legacy rolling-limit fields are deliberately ignored, even if present in
+    # an existing root-owned policy. They never affect admission.
+    queued = data.get("max_queued_jobs", DEFAULT_POLICY["max_queued_jobs"])
+    if type(queued) is not int or not 1 <= queued <= 128:
         raise QueueRejected("policy_invalid")
-    return data
+    return {"max_queued_jobs": queued}
 
 def capacity(records, policy, now=None):
     now = time.time() if now is None else now
@@ -62,24 +64,19 @@ def capacity(records, policy, now=None):
     return {
         "active_jobs": active, "model_jobs_24h": len(recent),
         "reserved_cost_usd_24h": float(reserved),
-        "max_model_jobs_24h": policy["max_model_jobs_24h"],
-        "max_reserved_cost_usd_24h": policy["max_reserved_cost_usd_24h"],
+        "max_model_jobs_24h": None,
+        "max_reserved_cost_usd_24h": None,
         "max_queued_jobs": policy["max_queued_jobs"],
-        "next_model_slot_in_seconds": max(0, int(recent[0]["created"] + 86400 - now) + 1) if recent else 0,
+        "max_job_cost_usd": MAX_COST,
+        "max_job_seconds": MAX_SECONDS,
     }
 
 def check_capacity(records, policy, engine, cost, now=None):
-    state = capacity(records, policy, now)
-    if state["active_jobs"] >= policy["max_queued_jobs"]:
+    active = sum(x["state"] in ("queued", "running") for x in records)
+    if active >= policy["max_queued_jobs"]:
         raise QueueRejected("queue_full")
-    if not engine.startswith("omp"):
-        return
-    if state["model_jobs_24h"] >= policy["max_model_jobs_24h"]:
-        raise QueueRejected("daily_job_limit", state["next_model_slot_in_seconds"])
-    if Decimal(str(state["reserved_cost_usd_24h"])) + Decimal(str(cost)) > Decimal(str(policy["max_reserved_cost_usd_24h"])):
-        raise QueueRejected("daily_cost_limit", state["next_model_slot_in_seconds"])
-MAX_SECONDS = 600
-MAX_COST = 0.50
+    # History and spend are informational only. No rolling admission quota.
+    return
 ALLOWED_ENGINES = ("omp", "omp-readonly", "selftest")
 LOCK = TASKS / ".lock"
 
@@ -120,14 +117,19 @@ def submit(a):
         raise ValueError("invalid repository")
     if not repo.is_dir() or not (repo / ".git").exists():
         raise QueueRejected("repository_missing")
+    # A Git worktree starts from a pinned commit, so unrelated uncommitted
+    # parent changes need not prevent delegation. Never stash or modify them.
+    head = git("rev-parse", "--verify", "HEAD^{commit}", cwd=repo)
     status = git("status", "--porcelain", cwd=repo)
-    if status.returncode != 0:
+    if head.returncode != 0 or status.returncode != 0:
         raise QueueRejected("repository_missing")
-    if status.stdout.strip():
-        raise QueueRejected("repository_dirty")
-    prompt = sys.stdin.read(10001)
-    if a.engine in ("omp", "omp-readonly") and (not prompt.strip() or len(prompt) > 10000):
-        raise ValueError("prompt required, max 10000 characters")
+    base_commit = head.stdout.strip()
+    if len(base_commit) not in (40, 64) or any(c not in "0123456789abcdef" for c in base_commit):
+        raise QueueRejected("repository_missing")
+    parent_dirty = bool(status.stdout.strip())
+    prompt = sys.stdin.read(24001)
+    if a.engine in ("omp", "omp-readonly") and (not prompt.strip() or len(prompt) > 24000):
+        raise ValueError("prompt required, max 24000 characters")
     if a.engine == "selftest":
         prompt = "internal non-networked queue smoke test"
     with LOCK.open("a+") as lock:
@@ -142,10 +144,10 @@ def submit(a):
         state = {"id": job_id, "repo": a.repo, "engine": a.engine,
                  "seconds": a.seconds, "max_cost_usd": a.cost, "state": "queued",
                  "created": time.time(), "finished": None,
-                 "worktree": None, "error": None}
+                 "worktree": None, "error": None, "base_commit": base_commit, "parent_dirty": parent_dirty}
         atomic_state(state)
     print(json.dumps({"id": job_id, "state": "queued", "repo": a.repo,
-                      "max_cost_usd": a.cost, "seconds": a.seconds}))
+                      "max_cost_usd": a.cost, "seconds": a.seconds, "base_commit": base_commit, "parent_dirty": parent_dirty}))
 
 def terminate_owned(child):
     if child.poll() is None:
@@ -168,7 +170,7 @@ def execute(job):
         worktree = WORKTREES / job["repo"] / job["id"]
         worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         branch = "job/" + job["id"]
-        added = git("worktree", "add", "-b", branch, str(worktree), "HEAD", cwd=repo)
+        added = git("worktree", "add", "-b", branch, str(worktree), job.get("base_commit") or "HEAD", cwd=repo)
         if added.returncode:
             job.update(state="failed", error="could not create isolated Git worktree", finished=time.time())
             atomic_state(job)
@@ -226,7 +228,7 @@ def daemon():
     print("LCP_AGENT_QUEUE_RUNNING max_parallel=1 policy=operator-configured", flush=True)
     while True:
         queued = [x for x in all_jobs() if x["state"] == "queued"]
-        for job in reversed(queued[:1]):
+        for job in queued[-1:]:
             if (TASKS / job["id"] / "cancel").exists():
                 job.update(state="cancelled", finished=time.time())
                 atomic_state(job)
@@ -240,8 +242,8 @@ def main():
     s = sub.add_parser("submit")
     s.add_argument("--repo", required=True)
     s.add_argument("--engine", choices=ALLOWED_ENGINES, default="omp")
-    s.add_argument("--seconds", type=int, default=180)
-    s.add_argument("--cost", type=float, default=0.25)
+    s.add_argument("--seconds", type=int, default=900)
+    s.add_argument("--cost", type=float, default=1.0)
     for cmd in ("status", "cancel", "logs"):
         sub.add_parser(cmd).add_argument("id")
     sub.add_parser("list")

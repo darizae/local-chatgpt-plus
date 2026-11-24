@@ -11,25 +11,25 @@ sub = parser.add_subparsers(dest='action', required=True)
 add = sub.add_parser('submit')
 add.add_argument('--repo', required=True)
 add.add_argument('--engine', choices=['omp', 'omp-readonly', 'selftest'], default='omp')
-add.add_argument('--seconds', type=int, default=90)
-add.add_argument('--cost', type=float, default=0.05)
+add.add_argument('--seconds', type=int, default=900)
+add.add_argument('--cost', type=float, default=1.0)
 sub.add_parser('capacity')
 for name in ('status', 'cancel', 'result'):
     sub.add_parser(name).add_argument('id')
 a = parser.parse_args()
 request = vars(a)
 if a.action == 'submit':
-    prompt = sys.stdin.read(6002)
+    prompt = sys.stdin.read(24001)
     request['prompt'] = prompt
 payload = (json.dumps(request, ensure_ascii=True) + '\n').encode('utf-8')
-if len(payload) > 14_000:
+if len(payload) > 300_000:
     parser.error('Request exceeds bounded broker limit')
 try:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(8)
         sock.connect(SOCKET)
         sock.sendall(payload)
-        response = sock.makefile('rb').readline(16_000)
+        response = sock.makefile('rb').readline(200_000)
     reply = json.loads(response)
 except (OSError, ValueError) as exc:
     print('Local agent broker unavailable: ' + str(exc)[:160], file=sys.stderr)
