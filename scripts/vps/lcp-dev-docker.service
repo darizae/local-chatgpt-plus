@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
+NotifyAccess=all
 User=lcp-containers
 Group=lcp-containers
 Environment=HOME=/var/lib/lcp-containers
