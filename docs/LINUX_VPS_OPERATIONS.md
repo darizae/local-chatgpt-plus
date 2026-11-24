@@ -12,6 +12,8 @@ No live quota or launcher profile is changed merely by compiling the repository.
 
 ## One-time administrator bootstrap
 
+For the full phased installation, including Docker, GitHub account authentication and live durable-job restart acceptance, use [VPS administrator handoff](VPS_ADMIN_HANDOFF.md). The independent durable job supervisor is installed as part of core bootstrap.
+
 Do not grant arbitrary sudo to the MCP process or let an agent-writable script execute as root. The host account and its systemd restrictions are deliberately independent of OAuth. The following one-time bootstrap is for the host administrator over the already authorized SSH or console channel. It installs a small fixed-operation maintenance interface; future routine application restarts do not need administrator interaction.
 
 1. In the VPS checkout, ensure there are no unrelated changes, run `npm run test:vps`, commit the desired source, and run `npm run build:vps` as the ordinary agent account. The build stamps the exact commit and SHA-256 digest of compiled JS; the server checks the stamp at startup. The previous dist tree is retained in `.mcp-state/vps-dist-previous`.
@@ -76,6 +78,12 @@ The last command returns an accepted receipt before the MCP transport is interru
 ```
 
 The maintenance status must be `completed`, the runtime commit must equal the requested compiled commit, and both service PIDs must differ from their pre-restart values. Verify the connector by executing a fresh actual MCP tool call. The restart worker also invokes the existing tunnel-readiness check, including fresh OpenAI polling. Explicit OFF remains authoritative; the broker will not turn off services back on. If deployment fails, retain the receipt and use the independent authorized administration path; roll back to a known-good committed build and restart. This first bridge does not automatically roll back application source or root components.
+
+## Persistent background jobs
+
+When the VPS service configures `LCP_DURABLE_JOBS_SOCKET`, the existing `start_process` tool automatically launches jobs through a separate non-root systemd supervisor, rather than attaching them to the MCP backend's cgroup. Its existing status, history, output, input and stop tools recognize durable IDs, and task execution status includes those jobs. Repeating an identical still-running start reuses the job. An unavailable configured supervisor returns an explicit error; it never silently starts a second local job. The durable job service has no dependency on the MCP or tunnel service.
+
+The daemon retains private, bounded stdout/stderr tails (512,000 bytes per stream, latest 250 finished jobs) so output is recoverable after reconnect. Raw command text is withheld from durable metadata. This is an explicit opt-in change from metadata-only history on other installations. Do not print credentials. Use foreground commands for long-lived processes. A supervisor restart or host reboot interrupts its jobs; persisted receipts are marked interrupted, never automatically replayed. Legacy local processes, synchronous commands, PTYs and the native subagent wrapper are not covered by this first migration. The separate model queue can be accessed using its direct job receipts.
 
 ## Security and remaining acceptance tests
 
