@@ -1,0 +1,19 @@
+#!/usr/bin/python3 -I
+"""Git operations via existing credential-isolated broker."""
+import argparse,json,os,socket,sys
+p=argparse.ArgumentParser()
+p.add_argument("action",choices=["fetch","push","status"])
+p.add_argument("--dry-run",action="store_true")
+a=p.parse_args()
+req={"action":a.action,"cwd":os.getcwd(),"remote":"origin","dry_run":a.dry_run}
+try:
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(600)
+        s.connect("/run/lcp-git-push-broker.sock")
+        s.sendall(json.dumps(req).encode())
+        answer=json.loads(s.makefile("rb").readline(8192))
+    print(json.dumps(answer))
+    sys.exit(0 if answer.get("ok") else 1)
+except (OSError,ValueError):
+    print("Git credential broker unavailable",file=sys.stderr)
+    sys.exit(2)

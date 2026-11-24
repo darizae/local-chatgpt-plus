@@ -12,6 +12,10 @@ export interface PermissionConfig {
   allow_write?: boolean;
   allow_commands?: boolean;
   allow_unsafe_runtimes?: boolean;
+  /** Independently opt in to ordinary workspace development capabilities. */
+  allow_workspace_pty?: boolean;
+  allow_workspace_repl?: boolean;
+  allow_configured_upstream_tools?: boolean;
   /** Narrow exception for one root-owned, non-writable bounded agent broker. */
   trusted_subagent_executable?: string;
   command_allow_patterns?: string[];
@@ -82,6 +86,9 @@ function normalizeConfig(raw: Partial<PermissionConfig> | undefined): Permission
     allow_write: optionalBoolean(raw?.allow_write, "allow_write"),
     allow_commands: optionalBoolean(raw?.allow_commands, "allow_commands"),
     allow_unsafe_runtimes: optionalBoolean(raw?.allow_unsafe_runtimes, "allow_unsafe_runtimes"),
+    allow_workspace_pty: optionalBoolean(raw?.allow_workspace_pty, "allow_workspace_pty"),
+    allow_workspace_repl: optionalBoolean(raw?.allow_workspace_repl, "allow_workspace_repl"),
+    allow_configured_upstream_tools: optionalBoolean(raw?.allow_configured_upstream_tools, "allow_configured_upstream_tools"),
     trusted_subagent_executable: trustedSubagent,
     command_allow_patterns: allowPatterns,
     command_deny_patterns: denyPatterns,
@@ -175,6 +182,15 @@ export function canUseUnsafeRuntimes(): boolean {
   if (config.profile === "open") return true;
   if (config.profile === "custom") return config.allow_unsafe_runtimes === true;
   return false;
+}
+
+export function requireDevelopmentCapability(kind: "pty" | "repl" | "upstream", cwd?: string): void {
+  if (cwd) assertPathAllowed(cwd);
+  const config = getPermissionConfig();
+  const enabled = kind === "pty" ? config.allow_workspace_pty
+    : kind === "repl" ? config.allow_workspace_repl : config.allow_configured_upstream_tools;
+  if (config.profile === "custom" && enabled === true && canRunCommands() && canWriteFiles()) return;
+  requireUnsafeRuntimeAllowed(kind === "pty" ? "PTY session" : kind === "repl" ? "node_repl" : "configured upstream tool");
 }
 
 export function canUseAnyAbsolutePath(): boolean {

@@ -1,0 +1,13 @@
+[Unit]
+Description=Agent-only local rootless Docker API socket
+
+[Socket]
+ListenStream=/run/lcp-dev-docker.sock
+SocketUser=agent
+SocketGroup=agent
+SocketMode=0600
+RemoveOnStop=yes
+Service=lcp-dev-docker-proxy.service
+
+[Install]
+WantedBy=sockets.target

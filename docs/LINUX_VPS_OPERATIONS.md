@@ -21,7 +21,8 @@ Do not grant arbitrary sudo to the MCP process or let an agent-writable script e
 ```bash
 # Run from the repository checkout as the authorized host administrator.
 sudo install -d -o root -g root -m 0700 /root/lcp-reviewed
-git archive HEAD scripts/lcp-vps-install.sh scripts/lcp-vpsctl \
+sudo -u agent git -C /home/agent/workspaces/projects/local-chatgpt-plus archive HEAD \
+  scripts/lcp-vps-install.sh scripts/lcp-vpsctl \
   scripts/lcp-vps-health.py scripts/lcp-vps-backend-reliability.conf \
   scripts/lcp-vps-tunnel-reliability.conf scripts/vps | \
   sudo tar --extract --no-same-owner --no-same-permissions -C /root/lcp-reviewed
@@ -31,6 +32,30 @@ sudo bash /root/lcp-reviewed/scripts/vps/lcp-admin-install.sh
 ```
 
 Use a fresh empty staging directory (if it already exists, inspect and archive it first); do not extract unreviewed code as root. The installer checks ownership/modes, backs up existing host files, stops the broker before checking for outstanding jobs, preserves queue isolation and installs the reliability migration. It starts the maintenance socket independently of the MCP. It preserves an existing operator queue policy, but the old rolling quota fields no longer have any effect. It also places npm, pnpm, pip, uv and browser-download caches in the existing writable workspace rather than the read-only home. If a later step fails, it restores the queue/broker artifacts and their active states; a successfully completed earlier tunnel migration remains in place. Preserve the reported backups and administrator access until live verification passes.
+
+## Development capability migration
+
+The combined installer also replaces the old Git broker with a reviewed credential-policy implementation, applies workspace-local caches and Git identity, removes the MCP/queue cgroup CPU/memory/task caps, enables separately scoped interactive PTY, subprocess REPL and explicitly configured upstream tools, and removes the legacy local Git/recursive-cleanup regex blocks. It does not enable general host administration or disclose provider credentials. It verifies the actual running application's stamped commit before declaring the reliability migration successful.
+
+The account's existing per-repository SSH credentials are migrated automatically. Normal non-force push of the checked-out branch, including main, does not require a clean working tree. The broker checks actual remote refs and scans newly reachable committed objects; GitHub's access and branch rules remain authoritative. For arbitrary new repositories, the authorized administrator must provision a GitHub account credential or repository key and set the corresponding basename in root-owned `/etc/lcp-vps/git-policy.json` (never put a private key in the checkout). The optional account credential removes per-repo mapping requirements for repositories it can access. Use `lcp-git-sync fetch` to fetch private origin branches without exposing keys; use `lcp-git-sync push --dry-run` for a publication preflight. Existing force/delete/tag restrictions and provider policies remain.
+
+For Docker/Compose support, after core bootstrap succeeds, run the independently reviewed rootless installation:
+
+```bash
+sudo bash /root/lcp-reviewed/scripts/vps/lcp-install-rootless-docker.sh
+```
+
+This installs required user-namespace helpers and starts a dedicated non-root daemon with an agent-only Unix socket. It does not expose the existing rootful Docker socket. Build contexts and named volumes work independently of the agent's private home. To bind mount a particular checkout, run `bash scripts/vps/lcp-dev-docker-bind.sh /absolute/path/to/repo` as its owner, explicitly granting the isolated container identity access to that repository. Compose plugin availability and actual daemon/container startup must be verified after installation.
+
+The workspace-local tools can already be used without restarting MCP:
+
+```bash
+source scripts/vps/lcp-dev-env.sh
+pnpm --version
+playwright --version
+```
+
+`bash scripts/vps/lcp-dev-provision.sh` is the pinned reproducible non-root setup and Chromium smoke test. The live VPS has already passed the npm installation and Chromium rendering probe.
 
 ## Normal development after bootstrap
 

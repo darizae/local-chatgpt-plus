@@ -103,6 +103,17 @@ restart_original_states
 if [[ "$backend_state" == active ]]; then
   "$helper" wait-mcp
   [[ "$(systemctl show "$backend" -p MainPID --value)" != "$old_backend" ]]
+  # Check the actual running application against the intended compiled artifact.
+  /usr/sbin/runuser -u agent -- /usr/bin/python3 -I -c '
+import json, pathlib, urllib.request
+root=pathlib.Path("/home/agent/workspaces/projects/local-chatgpt-plus")
+stamp=json.loads((root/"dist/.lcp-build.json").read_text())
+with urllib.request.urlopen("http://127.0.0.1:8766/health", timeout=5) as response:
+    health=json.load(response)
+if not stamp.get("commit") or health.get("artifactCommit")!=stamp["commit"] or health.get("buildCommit")!=stamp["commit"]:
+    raise SystemExit("Live compiled artifact identity mismatch")
+print("Verified live application commit:",stamp["commit"])
+'
 fi
 if [[ "$tunnel_state" == active ]]; then
   "$helper" wait-tunnel

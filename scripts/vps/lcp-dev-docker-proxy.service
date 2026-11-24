@@ -1,0 +1,14 @@
+[Unit]
+Description=Rootless Docker API proxy (no root privileges)
+Requires=lcp-dev-docker.service
+After=lcp-dev-docker.service
+
+[Service]
+User=lcp-containers
+Group=lcp-containers
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd /run/lcp-containers/docker.sock
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX

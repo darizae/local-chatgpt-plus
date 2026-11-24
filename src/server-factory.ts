@@ -27,7 +27,7 @@ import { TOOL_RESULT_OUTPUT_SCHEMA } from "./lib/tool-result.js";
 import { runLocalHooks } from "./lib/local-hooks.js";
 import { summarizeToolArgs } from "./lib/activity-log.js";
 import { beginToolCall, finishToolCall, type RuntimeToolKind } from "./lib/runtime-state.js";
-import { requireUnsafeRuntimeAllowed } from "./lib/permissions.js";
+import { requireDevelopmentCapability } from "./lib/permissions.js";
 import {
   autoCheckpointContextCapsule,
   getAutoCheckpointContextCapsule,
@@ -327,7 +327,7 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string, ses
 
       try {
         if (isUpstreamProxy && !readOnly) {
-          requireUnsafeRuntimeAllowed(`upstream MCP tool '${toolName}'`);
+          requireDevelopmentCapability("upstream");
         }
 
         if (!readOnly) {

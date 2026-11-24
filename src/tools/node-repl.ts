@@ -6,13 +6,17 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
-import { requireUnsafeRuntimeAllowed } from "../lib/permissions.js";
+import { requireDevelopmentCapability, canUseUnsafeRuntimes } from "../lib/permissions.js";
+import { DevelopmentRepl } from "../lib/development-repl.js";
+import { validatePath } from "../lib/path-security.js";
+import { getCurrentSessionState } from "../lib/session-context.js";
 
 interface ReplState {
   context: vm.Context;
 }
 
 const states = new WeakMap<McpServer, ReplState>();
+const workers = new WeakMap<McpServer, DevelopmentRepl>();
 
 function createState(workspaceRoot: string): ReplState {
   const output: string[] = [];
@@ -46,18 +50,31 @@ export function registerNodeReplTool(server: McpServer, workspaceRoot: string): 
     async ({ action, code, timeout_ms }) => {
       if (action === "reset") {
         states.delete(server);
+        workers.get(server)?.reset();
+        workers.delete(server);
         return toolResult("node_repl", { reset: true });
-      }
-      let state = states.get(server);
-      if (!state) {
-        state = createState(workspaceRoot);
-        states.set(server, state);
       }
       if (action === "status") {
         return toolResult("node_repl", { persistent: true, computer_use_available: false, computer_use_error: "Use the separate browser MCP integration for computer control." });
       }
       if (!code?.trim()) throw new Error("code is required for node_repl eval");
-      requireUnsafeRuntimeAllowed("node_repl");
+      const scope = getCurrentSessionState();
+      const cwd = await validatePath(scope?.project_root || workspaceRoot);
+      requireDevelopmentCapability("repl", cwd);
+      if (!canUseUnsafeRuntimes()) {
+        let worker = workers.get(server);
+        if (!worker || worker.cwd !== cwd) {
+          worker?.reset();
+          worker = new DevelopmentRepl(cwd);
+          workers.set(server, worker);
+        }
+        return toolResult("node_repl", { ...(await worker.evaluate(code, timeout_ms)), computer_use_available:false });
+      }
+      let state = states.get(server);
+      if (!state) {
+        state = createState(cwd);
+        states.set(server,state);
+      }
       const output = state.context.__localCoderOutput as string[];
       output.length = 0;
       const value = await vm.runInContext(`(async () => { ${code}\n})()`, state.context, { timeout: timeout_ms }) as Promise<unknown>;

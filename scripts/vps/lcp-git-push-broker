@@ -1,0 +1,256 @@
+#!/usr/bin/python3 -I
+"""Private non-root GitHub push broker; per-repo SSH credentials never enter LCP."""
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import struct
+import subprocess
+
+PROJECTS = Path("/home/agent/workspaces/projects")
+SOCKET_FD = 3
+MAX_REQUEST = 4096
+POLICY = Path("/etc/lcp-vps/git-policy.json")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
+
+def policy():
+    import stat
+    with POLICY.open() as handle:
+        info = os.fstat(handle.fileno())
+        if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode) or POLICY.is_symlink():
+            raise ValueError("invalid Git credential policy ownership")
+        data = json.load(handle)
+    owner = data.get("owner")
+    keys = data.get("repo_keys", {})
+    account = data.get("account_key")
+    if not isinstance(owner, str) or not NAME.fullmatch(owner) or not isinstance(keys, dict):
+        raise ValueError("invalid Git credential policy")
+    if any(not isinstance(k,str) or not NAME.fullmatch(k) or not isinstance(v,str) or not NAME.fullmatch(v) for k,v in keys.items()):
+        raise ValueError("invalid repo key mapping")
+    if account is not None and (not isinstance(account,str) or not NAME.fullmatch(account)):
+        raise ValueError("invalid account key")
+    return owner, keys, account
+
+def origin_repo(origin, owner):
+    for prefix in ("https://github.com/"+owner+"/", "git@github.com:"+owner+"/"):
+        if origin.startswith(prefix):
+            name = origin[len(prefix):].removesuffix(".git")
+            if NAME.fullmatch(name):
+                return name
+    raise ValueError("origin must be a repository in the authorized GitHub account")
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,115}$")
+SECRET_PATTERNS = (
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,})\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+)
+SYNTHETIC_EXAMPLES = {
+    "AKIAIOSFODNN7EXAMPLE", "sk-abcdefghijklmnopqrstuvwxyz123456",
+    "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+    "xoxb-1234567890-abcdefghijkl"
+}
+
+def git(cwd, *args, timeout=25, env=None):
+    return subprocess.run(
+        ["/usr/bin/git", "-C", str(cwd),
+         "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+         "-c", "protocol.ext.allow=never", *args],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, check=False, timeout=timeout, env=env)
+
+def workspace(source):
+    if not isinstance(source, str) or len(source) > 400:
+        raise ValueError("invalid worktree path")
+    supplied = Path(source)
+    if not supplied.is_absolute() or supplied.is_symlink():
+        raise ValueError("worktree path must be absolute and not a symlink")
+    cwd = supplied.resolve(strict=True)
+    if not cwd.is_relative_to(PROJECTS):
+        raise ValueError("outside allowed projects workspace")
+    common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.returncode:
+        raise ValueError("not a recognized Git working tree")
+    gitdir = Path(common.stdout.strip()).resolve()
+    if not gitdir.is_relative_to(PROJECTS):
+        raise ValueError("Git common directory outside allowed projects")
+    owner, keys, account = policy()
+    origin = git(cwd, "config", "--get", "remote.origin.url")
+    if origin.returncode:
+        raise ValueError("repository origin is missing")
+    repo = origin_repo(origin.stdout.strip(), owner)
+    key = keys.get(repo, account)
+    if key is None:
+        raise ValueError("GitHub credential not provisioned for this repository; use an authorized account credential or repo key")
+    branch = git(cwd, "symbolic-ref", "-q", "--short", "HEAD")
+    if branch.returncode:
+        raise ValueError("detached HEAD cannot be pushed")
+    name = branch.stdout.strip()
+    if not BRANCH_RE.fullmatch(name) or "//" in name or ".." in name or name.endswith(".lock"):
+        raise ValueError("invalid branch name")
+    # Only committed HEAD is sent. Uncommitted files do not affect a push.
+    # GitHub itself enforces repository and branch protection rules.
+    return cwd, repo, name, owner, key
+
+def scan_path(rel):
+    low = rel.lower()
+    parts = low.split("/")
+    leaf = parts[-1]
+    if (any(segment in (".ssh", ".aws", ".config") for segment in parts)
+        or (".agents" in parts and "private" in low)
+        or low.endswith((".pem", ".key", ".p12", ".pfx", "id_rsa", "id_ed25519"))
+        or leaf == ".env" or (leaf.startswith(".env.") and leaf != ".env.example")):
+        raise ValueError("refused: sensitive committed path")
+
+def scan_text(rel, text):
+    for line in text.splitlines():
+        if rel == "scripts/audit-git-history.mjs" and "/-----BEGIN" in line:
+            continue
+        for pattern in SECRET_PATTERNS:
+            for match in pattern.finditer(line):
+                if match.group() not in SYNTHETIC_EXAMPLES:
+                    raise ValueError("refused: credential pattern in committed file")
+
+def inspect_outgoing(cwd, remote_refs):
+    # Remote-proven refs only: do not trust a mutable local origin/main
+    # baseline. Inspect every newly reachable commit including deleted secrets.
+    refs = []
+    for ref in remote_refs:
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref) and git(cwd, "cat-file", "-e", ref+"^{commit}").returncode == 0:
+            refs.append(ref)
+    commits = git(cwd, "rev-list", "HEAD", "--not", *set(refs), timeout=120)
+    if commits.returncode:
+        raise ValueError("cannot enumerate outgoing commits")
+    seen = set()
+    for commit in commits.stdout.splitlines():
+        changed = git(cwd, "diff-tree", "--root", "-m", "-r", "--no-commit-id", "-z", "--name-only", "--diff-filter=ACMR", commit)
+        if changed.returncode:
+            raise ValueError("cannot inspect outgoing commit")
+        for rel in set(changed.stdout.split("\x00")) - {""}:
+            scan_path(rel)
+            oid = git(cwd, "rev-parse", "--verify", commit+":"+rel)
+            if oid.returncode:
+                raise ValueError("cannot inspect committed object")
+            obj = oid.stdout.strip()
+            if (obj, rel) in seen:
+                continue
+            seen.add((obj, rel))
+            kind = git(cwd, "cat-file", "-t", obj)
+            if kind.returncode:
+                # Submodule gitlinks need not exist in the parent object DB.
+                tree = git(cwd, "ls-tree", commit, "--", rel)
+                if tree.stdout.startswith("160000 commit "):
+                    continue
+                raise ValueError("cannot inspect committed object type")
+            if kind.stdout.strip() != "blob":
+                continue
+            with subprocess.Popen(["/usr/bin/git", "-C", str(cwd), "cat-file", "blob", obj],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as blob:
+                try:
+                    tail = b""
+                    while True:
+                        chunk = blob.stdout.read(65536)
+                        if not chunk:
+                            break
+                        scan_text(rel, (tail + chunk).decode("latin-1"))
+                        tail = (tail + chunk)[-4096:]
+                    if blob.wait(timeout=25):
+                        raise ValueError("cannot read committed blob")
+                finally:
+                    if blob.poll() is None:
+                        blob.kill()
+                        blob.wait()
+
+def sync(req):
+    cwd, repo, branch, owner, key_name = workspace(req.get("cwd"))
+    if req.get("remote", "origin") != "origin":
+        raise ValueError("only origin can be pushed")
+    action = req.get("action")
+    if action == "push" and req.get("branch") not in (None, branch, "HEAD", "refs/heads/"+branch):
+        raise ValueError("push ref must match the checked-out branch")
+    dry = req.get("dry_run", False)
+    if type(dry) is not bool:
+        raise ValueError("dry_run must be boolean")
+    key = Path("/home/agent/.ssh") / key_name
+    known_hosts = Path("/home/agent/.ssh/known_hosts")
+    if not key.is_file() or not known_hosts.is_file() or os.stat(key).st_mode & 0o077:
+        raise ValueError("repository-scoped SSH key unavailable")
+    ssh = (
+        "/usr/bin/ssh -i "+str(key)+" -o IdentitiesOnly=yes "
+        "-o StrictHostKeyChecking=yes -o UserKnownHostsFile="+str(known_hosts)+" "
+        "-o BatchMode=yes -o ConnectTimeout=10"
+    )
+    env = {
+        "HOME":"/home/agent", "PATH":"/usr/bin:/bin", "LANG":"C",
+        "GIT_TERMINAL_PROMPT":"0", "GIT_CONFIG_NOSYSTEM":"1",
+        "GIT_CONFIG_GLOBAL":"/dev/null", "GIT_SSH_COMMAND":ssh,
+        "GIT_ALLOW_PROTOCOL":"ssh"
+    }
+    remote = "git@github.com:"+owner+"/"+repo+".git"
+    if action == "fetch":
+        if dry:
+            raise ValueError("fetch dry run not supported")
+        fetched = git(cwd, "fetch", "--no-recurse-submodules", remote,
+                      "+refs/heads/*:refs/remotes/origin/*", timeout=300, env=env)
+        return {"ok": fetched.returncode == 0, "repo": repo,
+                "message": "GitHub fetch completed" if not fetched.returncode else "GitHub fetch rejected or unavailable"}
+    advertised = git(cwd, "ls-remote", "--refs", remote, timeout=65, env=env)
+    if advertised.returncode:
+        raise ValueError("GitHub authentication or remote repository unavailable")
+    remote_refs = [line.split("\t", 1)[0] for line in advertised.stdout.splitlines()]
+    inspect_outgoing(cwd, remote_refs)
+    args = ["push", "--porcelain"]
+    if dry:
+        args.append("--dry-run")
+    args += [remote, "HEAD:refs/heads/"+branch]
+    p = git(cwd, *args, timeout=300, env=env)
+    if p.returncode:
+        print("git_push_denied repo="+repo+" branch="+branch+" exit="+str(p.returncode),flush=True)
+        return {"ok":False,"repo":repo,"branch":branch,"dry_run":dry,
+                "message":"GitHub rejected push or SSH access; credentials may need registration"}
+    if not dry:
+        git(cwd, "config", "branch."+branch+".remote", "origin")
+        git(cwd, "config", "branch."+branch+".merge", "refs/heads/"+branch)
+    print("git_push_ok repo="+repo+" branch="+branch+" dry_run="+str(dry),flush=True)
+    return {"ok":True,"repo":repo,"branch":branch,"dry_run":dry,
+            "message":"GitHub accepted push" if not dry else "GitHub accepted dry run"}
+
+def serve():
+    sock = socket.socket(fileno=3)
+    expected_uid = os.getuid()
+    print("lcp_git_push_broker_credential_policy_ready",flush=True)
+    while True:
+        conn, _ = sock.accept()
+        with conn:
+            conn.settimeout(8)
+            try:
+                pid, uid, group = struct.unpack("3i",conn.getsockopt(
+                    socket.SOL_SOCKET,socket.SO_PEERCRED,struct.calcsize("3i")))
+                if uid != expected_uid:
+                    raise PermissionError("unauthorized peer")
+                raw = conn.recv(MAX_REQUEST+1)
+                if len(raw)>MAX_REQUEST:
+                    raise ValueError("request too large")
+                req=json.loads(raw.decode("utf-8"))
+                if not isinstance(req,dict):
+                    raise ValueError("invalid request")
+                if req.get("action")=="status":
+                    _, keys, account = policy()
+                    answer={"ok":True,"message":"Git credential broker ready (all branches; account or repository credentials)",
+                            "repo_credentials":len(keys),"account_credential_configured":account is not None}
+                elif req.get("action") in ("push", "fetch"):
+                    answer=sync(req)
+                else:
+                    raise ValueError("unsupported operation")
+            except (OSError, ValueError, PermissionError, subprocess.TimeoutExpired) as e:
+                answer={"ok":False,"message":str(e)[:300]}
+            try:
+                conn.sendall((json.dumps(answer)+"\n").encode())
+            except OSError:
+                pass
+if __name__=="__main__":
+    serve()

@@ -1,0 +1,26 @@
+[Unit]
+Description=Dedicated rootless Docker daemon for LCP development
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=lcp-containers
+Group=lcp-containers
+Environment=HOME=/var/lib/lcp-containers
+Environment=XDG_RUNTIME_DIR=/run/lcp-containers
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+RuntimeDirectory=lcp-containers
+RuntimeDirectoryMode=0700
+StateDirectory=lcp-containers
+StateDirectoryMode=0700
+ExecStart=/usr/bin/dockerd-rootless.sh --host=unix:///run/lcp-containers/docker.sock --data-root=/var/lib/lcp-containers/docker
+Delegate=yes
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=90
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

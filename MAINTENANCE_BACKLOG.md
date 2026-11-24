@@ -34,13 +34,14 @@
 
 ## VPS repository development friction audit
 
-- [x] Redirect npm/pnpm/pip/uv/browser caches into a writable workspace-local directory in the reviewed migration. Live install still pending.
-- [ ] Verify fresh installs with npm, pnpm and uv/pip inside the real service; provision a pinned pnpm executable (not currently on the MCP PATH) and browser runtime/dependencies.
-- [ ] Make Git identity setup and repo onboarding routine: standard commits currently require an identity, private fetch/clone may need scoped credentials, and push broker only accepts pre-registered origin/feature branches. Preserve protected branch/secret checks; add an owner-approved repo registration/PR workflow.
-- [ ] Add isolated rootless container/build/test capability for Docker/Compose workflows; access to the existing rootful Docker socket is denied. Do not grant arbitrary host-root-equivalent Docker access.
-- [ ] Measure and tune MCP/worker cgroup resource ceilings (MCP 640 MiB RAM, one CPU, 128 tasks; worker 1.5 GiB RAM, one CPU, 128 tasks); distinguish memory/CPU exhaustion from application errors and avoid imposing arbitrary limits on normal repo builds.
-- [ ] Provide structured, scoped alternatives for blocked interactive PTY/REPL/browser tools and ordinary cleanup commands; raw command-text deny regexes produce false positives and unrestricted runtimes are disabled. Keep the actual OS boundary and credential isolation intact.
-- [ ] Add durable detached build/deploy jobs across MCP restarts, richer broker status/resume for model jobs, and a provider-credential-isolated private Git fetch path. The MCP connection and host-side runtime remain different failure domains.
+- [x] Install pinned pnpm 11.1.3, Playwright 1.65.1 and Chromium in writable VPS workspace caches through the live connector; browser smoke rendered a test page successfully. Add automatic cache/PATH/Git identity configuration to migration.
+- [x] Implement owner-approved normal non-force pushes from any branch and dirty checkouts, no arbitrary binary/size/file-count publication bans, account credential fallback for new repositories, authenticated fetch and workspace Git identity. Tests use isolated repositories; live broker replacement pending.
+- [x] Prepare dedicated rootless Docker daemon, local agent socket proxy and per-project bind-mount ACL helper. Systemd unit syntax validated; package installation and container smoke require authorized host bootstrap.
+- [x] Remove arbitrary CPU, RAM and task ceilings for MCP and model worker in reviewed drop-ins; retain physical host limits and credential boundaries. Live install pending.
+- [x] Implement separately opted-in workspace PTY and subprocess REPL, explicit configured upstream tools, and removal of legacy local Git/recursive-cleanup command regexes during authorized bootstrap. Keep in-process unrestricted REPL and host-wide privileged operations disabled under the custom profile.
+- [ ] Run authorized administrator bootstrap; verify live limits reset, Git fetch/push dry-run for authorized repositories and main, actual PTY/REPL/upstream calls, npm/pnpm/uv/pip cache paths and rootless Docker/Compose smoke. Provision owner-approved account-wide GitHub credential if new private repositories need access. GitHub's own permissions/branch protections still apply.
+- [ ] Verify browser screenshots are returned as native model-visible MCP image content; working Chromium does not fix the hosted adapter image issue.
+- [ ] Add durable detached build/deploy jobs across MCP restarts, richer broker status/resume for model jobs, and transparent native Git pull/clone integration using the new credential-isolated fetch path. The MCP connection and host-side runtime remain different failure domains.
 - [ ] Validate arbitrary registered project layouts (nested repositories and worktrees), explicit uncommitted-change snapshots, bounded parallel workers and complete model artifact retrieval; native queue currently accepts direct named repositories and uses committed HEAD only.
 - [ ] Audit current host privileges with the authorized operator, then implement reusable, scoped maintenance operations for routine service/container/package setup instead of repeated manual intervention.
 
