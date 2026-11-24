@@ -10,7 +10,7 @@ const JOB_LABEL = "com.localchatgpt.plus.tunnel";
 
 export type DashboardTunnelSnapshot = TunnelSnapshot & {
   /** The observer is not an additional supervisor; it never starts a tunnel. */
-  management: "internal" | "launchd" | "not_monitored";
+  management: "internal" | "launchd" | "systemd" | "not_monitored";
 };
 
 interface ProbeDependencies {
@@ -22,6 +22,9 @@ interface ProbeDependencies {
   launchctlPrint?: (label: string) => Promise<string>;
   readProfile?: (file: string) => Promise<string>;
   ready?: (port: number) => Promise<boolean>;
+  systemdEnabled?: boolean;
+  systemdShow?: () => Promise<string>;
+  pollFresh?: (port: number) => Promise<boolean>;
 }
 
 type ExternalTunnel = Pick<TunnelSnapshot,
@@ -38,7 +41,7 @@ async function defaultLaunchctlPrint(label: string): Promise<string> {
 async function defaultReady(port: number): Promise<boolean> {
   try {
     const response = await fetch("http://127.0.0.1:" + port + "/readyz", {
-      signal: AbortSignal.timeout(1500),
+      signal: AbortSignal.timeout(1500), redirect: "error",
     });
     if (!response.ok) return false;
     const text = await response.text();
@@ -48,8 +51,32 @@ async function defaultReady(port: number): Promise<boolean> {
   }
 }
 
+export function freshControlPlanePoll(metrics: string, nowSeconds: number): boolean {
+  const rows = [...metrics.matchAll(/^commands_poll_last_successful_timestamp_seconds(?:\{[^\n]*\})?[ \t]+(\S+)[ \t]*$/gm)];
+  if (rows.length !== 1) return false;
+  const age = nowSeconds - Number(rows[0][1]);
+  return Number.isFinite(age) && age >= -5 && age <= 120;
+}
+
+async function defaultPollFresh(port: number): Promise<boolean> {
+  try {
+    const response = await fetch("http://127.0.0.1:" + port + "/metrics", {
+      signal: AbortSignal.timeout(1500), redirect: "error",
+    });
+    return response.ok && freshControlPlanePoll(await response.text(), Date.now() / 1000);
+  } catch { return false; }
+}
+
+async function defaultSystemdShow(): Promise<string> {
+  const { stdout } = await execFileAsync("/usr/bin/systemctl", [
+    "show", "lcp-vps-tunnel.service", "-p", "LoadState", "-p", "FragmentPath",
+    "-p", "DropInPaths", "-p", "ActiveState", "-p", "MainPID", "-p", "NRestarts",
+  ], { timeout: 1800, maxBuffer: 16 * 1024 });
+  return stdout;
+}
+
 /**
- * Read-only observation of the lcp-installed launchd job.
+ * Read-only observation of the installed launchd job or opt-in Aruba systemd service.
  * Never treat a random listener on 8090 as the user's MCP tunnel: require
  * the exact launchd job, its configured profile, and the expected MCP target.
  * Never return raw launchctl output, profile text, paths or bearer tokens.
@@ -66,11 +93,39 @@ export function createDashboardTunnelResolver(
   const launchctlPrint = deps.launchctlPrint ?? defaultLaunchctlPrint;
   const readProfile = deps.readProfile ?? ((file: string) => fs.readFile(file, "utf8"));
   const ready = deps.ready ?? defaultReady;
+  const systemdEnabled = deps.systemdEnabled ?? process.env.LCP_SYSTEMD_TUNNEL_MONITOR === "1";
+  const systemdShow = deps.systemdShow ?? defaultSystemdShow;
+  const pollFresh = deps.pollFresh ?? defaultPollFresh;
+
+  async function observeSystemd(): Promise<ExternalTunnel | null> {
+    // Opt-in is installed by the root-owned Aruba backend drop-in. Only recognize
+    // the paired deployment and exact systemd unit/drop-in, never arbitrary ports.
+    if (!systemdEnabled || mcpPort !== 8766) return null;
+    const fields = new Map((await systemdShow()).split("\n").filter(line => line.includes("="))
+      .map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+    if (fields.get("LoadState") !== "loaded" ||
+        fields.get("FragmentPath") !== "/etc/systemd/system/lcp-vps-tunnel.service" ||
+        !fields.get("DropInPaths")?.split(/\s+/).includes("/etc/systemd/system/lcp-vps-tunnel.service.d/50-lcp-reliability.conf")) return null;
+    const healthPort = 8790;
+    const pid = Number(fields.get("MainPID"));
+    const restarts = Math.max(0, Number(fields.get("NRestarts")) || 0);
+    const active = fields.get("ActiveState");
+    if (active !== "active" || !Number.isSafeInteger(pid) || pid <= 0) {
+      return { configured: true, health_port: healthPort, pid: null, restarts,
+        status: active === "activating" ? "starting" : active === "failed" ? "degraded" : "stopped",
+        last_error: "systemd tunnel is not active" };
+    }
+    const healthy = await ready(healthPort) && await pollFresh(healthPort);
+    return { configured: true, health_port: healthPort, pid, restarts,
+      status: healthy ? "online" : "degraded",
+      last_error: healthy ? null : "systemd tunnel readiness or control-plane polling is unhealthy" };
+  }
   let cached: ExternalTunnel | null = null;
   let cachedAt = Number.NEGATIVE_INFINITY;
   let inflight: Promise<ExternalTunnel | null> | null = null;
 
   async function observe(): Promise<ExternalTunnel | null> {
+    if (platform === "linux") return observeSystemd();
     if (platform !== "darwin" || uid == null) return null;
     const label = "gui/" + uid + "/" + JOB_LABEL;
     let info: string;
@@ -147,7 +202,7 @@ export function createDashboardTunnelResolver(
       ...snapshot,
       ...external,
       managed: false,
-      management: "launchd",
+      management: platform === "linux" ? "systemd" : "launchd",
       reused_external: false,
     };
   };
