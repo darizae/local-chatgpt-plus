@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { createDashboardTunnelResolver } from "../dist/lib/dashboard-tunnel-status.js";
+import { createDashboardTunnelResolver, freshControlPlanePoll } from "../dist/lib/dashboard-tunnel-status.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const home = "/Users/test-operator";
@@ -116,6 +116,45 @@ await test("concurrent requests deduplicate and respect TTL", async () => {
   await resolve(baseline());
   assert.equal(calls.job, 2);
 });
+await test("systemd only recognizes explicitly opted-in paired Aruba unit", async () => {
+  const info = [
+    "LoadState=loaded", "FragmentPath=/etc/systemd/system/lcp-vps-tunnel.service",
+    "DropInPaths=/etc/systemd/system/lcp-vps-tunnel.service.d/50-lcp-reliability.conf",
+    "ActiveState=active", "MainPID=12345", "NRestarts=2",
+  ].join("\n");
+  const deps = { platform: "linux", systemdEnabled: true,
+    systemdShow: async () => info, ready: async port => port === 8790,
+    pollFresh: async port => port === 8790 };
+  const result = await createDashboardTunnelResolver(8766, deps)(baseline());
+  assert.equal(result.management, "systemd");
+  assert.equal(result.status, "online");
+  assert.equal(result.pid, 12345);
+  assert.equal(result.restarts, 2);
+  for (const [override, status] of [
+    [{ pollFresh: async () => false }, "degraded"],
+    [{ ready: async () => false }, "degraded"],
+    [{ systemdShow: async () => info.replace("active", "inactive") }, "stopped"],
+    [{ systemdShow: async () => info.replace("active", "activating") }, "starting"],
+    [{ systemdShow: async () => info.replace("active", "failed") }, "degraded"],
+  ]) {
+    assert.equal((await createDashboardTunnelResolver(8766, { ...deps, ...override })(baseline())).status, status);
+  }
+  for (const override of [
+    { systemdEnabled: false },
+    { systemdShow: async () => info.replace("50-lcp-reliability.conf", "other.conf") },
+    { systemdShow: async () => { throw new Error("not found"); } },
+  ]) {
+    assert.equal((await createDashboardTunnelResolver(8766, { ...deps, ...override })(baseline())).management, "not_monitored");
+  }
+  assert.equal((await createDashboardTunnelResolver(3000, deps)(baseline())).management, "not_monitored");
+});
+await test("poll metric must be present, fresh, finite and unambiguous", async () => {
+  const key = "commands_poll_last_successful_timestamp_seconds";
+  assert.equal(freshControlPlanePoll(key + '{scope="controlplane"} 1e3', 1000), true);
+  for (const input of ["", key + " 879", key + " NaN", key + " 1006", key + "\n1000", key + " 1000\n" + key + " 1000"]) {
+    assert.equal(freshControlPlanePoll(input, 1000), false);
+  }
+});
 await test("Admin labels launchd separately from disabled internal supervisor", async () => {
   const src = fs.readFileSync(path.join(root, "public/ui/app.js"), "utf8");
   const m = src.match(/function tunnelDisplay\(tunnel\) \{[\s\S]*?\n\}\n\nfunction renderRuntimeOverview/);
@@ -125,6 +164,7 @@ await test("Admin labels launchd separately from disabled internal supervisor", 
   assert.equal(online.label, "ONLINE");
   assert.equal(online.detail, "launchd-managed · health :8090 · 0 restart(s)");
   assert.equal(online.healthy, true);
+  assert.equal(fn({ management: "systemd", status: "degraded", health_port: 8790, restarts: 2 }).detail, "systemd-managed · health :8790 · 2 restart(s)");
   assert.equal(fn(baseline()).label, "NOT MONITORED");
   assert.equal(fn({ managed: true, status: "online", health_port: 8080 }).label, "ONLINE");
   assert.ok(src.includes("tunnelDisplay(tunnel).detail"));

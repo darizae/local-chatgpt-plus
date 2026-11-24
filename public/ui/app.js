@@ -368,10 +368,10 @@ function runtimeKind(kind) {
 function tunnelDisplay(tunnel) {
   const state = String(tunnel?.status || "unknown").toLowerCase();
   const manager = String(tunnel?.management || "");
-  if (manager === "launchd") {
+  if (manager === "launchd" || manager === "systemd") {
     return {
       label: state.toUpperCase(),
-      detail: `launchd-managed · health :${tunnel.health_port} · ${tunnel.restarts ?? 0} restart(s)`,
+      detail: `${manager}-managed · health :${tunnel.health_port} · ${tunnel.restarts ?? 0} restart(s)`,
       healthy: state === "online",
     };
   }
@@ -1118,7 +1118,7 @@ function renderActivityStatusBar(runtimeInfo, health) {
     { cls: "", text: `Sessions · ${sessions}` },
     { cls: jobs ? "busy" : "", text: `Jobs · ${jobs}` },
     { cls: "", text: `Last tool · ${lastTool}` },
-    { cls: tunnelDisplay(tunnel).healthy ? "ok" : "", text: `Tunnel · ${tunnelDisplay(tunnel).label}${tunnel.management === "launchd" ? " (launchd)" : ""}` },
+    { cls: tunnelDisplay(tunnel).healthy ? "ok" : "", text: `Tunnel · ${tunnelDisplay(tunnel).label}${["launchd", "systemd"].includes(tunnel.management) ? ` (${tunnel.management})` : ""}` },
   ];
   el.innerHTML = chips
     .map((c) => `<span class="status-chip ${c.cls}">${esc(c.text)}</span>`)

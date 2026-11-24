@@ -24,6 +24,7 @@ export interface TunnelSnapshot {
 }
 
 const MAX_LOG_CHARS = 40_000;
+const STARTUP_GRACE_MS = 60_000;
 const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 
 function truthy(value: string | undefined): boolean {
@@ -58,11 +59,11 @@ export function redactTunnelDiagnosticText(value: string): string {
 async function ready(port: number): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/readyz`, {
-      signal: AbortSignal.timeout(1_500),
+      signal: AbortSignal.timeout(1_500), redirect: "error",
     });
     if (!response.ok) return false;
     const text = await response.text();
-    return /ready|ok/i.test(text);
+    return /^(ready|ok)\b/i.test(text.trim());
   } catch {
     return false;
   }
@@ -123,6 +124,8 @@ async function writeProfile(root: string, port: number, healthPort: number, tunn
 export function createTunnelSupervisor(options: {
   root: string;
   mcpPort: number;
+  /** Override only for deterministic supervisor tests. */
+  startupGraceMs?: number;
 }): {
   start: () => Promise<void>;
   stop: () => Promise<void>;
@@ -132,7 +135,8 @@ export function createTunnelSupervisor(options: {
   const healthPort = boundedPort(process.env.OPENAI_TUNNEL_HEALTH_PORT, 8080);
   const tunnelId = (process.env.OPENAI_TUNNEL_ID || "").trim();
   const apiKey = (process.env.OPENAI_TUNNEL_API_KEY || "").trim();
-  const managed = truthy(process.env.LOCAL_CODER_MANAGE_TUNNEL);
+  const managed = truthy(process.env.LOCAL_CODER_MANAGE_TUNNEL) &&
+    !(process.platform === "linux" && process.env.LCP_SYSTEMD_TUNNEL_MONITOR === "1");
   const configured = Boolean(tunnelId && apiKey);
   let child: ChildProcess | null = null;
   let stopping = false;
@@ -146,9 +150,14 @@ export function createTunnelSupervisor(options: {
   let lastExitCode: number | null = null;
   let restarts = 0;
   let reusedExternal = false;
+  let externalObserved = false;
   let lastError: string | null = null;
   let logTail = "";
   let healthMisses = 0;
+  let childReady = false;
+  let childStartedMs = 0;
+  let terminating = false;
+  let healthPollInFlight = false;
 
   const snapshot = (): TunnelSnapshot => ({
     managed,
@@ -169,8 +178,11 @@ export function createTunnelSupervisor(options: {
 
   const pollHealth = async () => {
     if (stopping || status === "disabled" || status === "not_configured") return;
-    if (await ready(healthPort)) {
+    const healthy = await ready(healthPort);
+    if (stopping) return;
+    if (healthy) {
       if (!child && !reusedExternal) {
+        externalObserved = true;
         if (!(await profileMatchesExpected(root, options.mcpPort, healthPort, tunnelId))) {
           healthMisses = 0;
           status = "degraded";
@@ -180,6 +192,7 @@ export function createTunnelSupervisor(options: {
         reusedExternal = true;
       }
       healthMisses = 0;
+      if (child) childReady = true;
       status = "online";
       lastReadyAt = new Date().toISOString();
       restartAttempt = 0;
@@ -188,18 +201,26 @@ export function createTunnelSupervisor(options: {
     }
 
     healthMisses++;
-    if (reusedExternal) {
-      reusedExternal = false;
+    if (externalObserved && !child) {
       status = "degraded";
-      lastError = "previously reused tunnel health endpoint is no longer ready";
-      scheduleRestart(spawnManaged);
+      lastError = "external tunnel health endpoint is no longer ready; external supervisor owns recovery";
       return;
     }
     if (child && child.exitCode === null) {
-      status = lastReadyAt ? "degraded" : "starting";
-      if (healthMisses >= 3 && lastReadyAt && healthMisses === 3) {
-        lastError = "managed tunnel stopped reporting healthy state; restarting it";
-        try { child.kill("SIGTERM"); } catch {}
+      status = childReady ? "degraded" : "starting";
+      if (!terminating && ((childReady && healthMisses >= 3) ||
+          (!childReady && Date.now() - childStartedMs >= (options.startupGraceMs ?? STARTUP_GRACE_MS)))) {
+        terminating = true;
+        lastError = "managed tunnel failed to report healthy state; restarting it";
+        const current = child;
+        const killTimer = setTimeout(() => {
+          if (child === current && current.exitCode === null) {
+            try { current.kill("SIGKILL"); } catch {}
+          }
+        }, 5_000);
+        killTimer.unref?.();
+        current.once("close", () => clearTimeout(killTimer));
+        try { current.kill("SIGTERM"); } catch {}
       }
       return;
     }
@@ -207,9 +228,15 @@ export function createTunnelSupervisor(options: {
     scheduleRestart(spawnManaged);
   };
 
+  const guardedPoll = async () => {
+    if (healthPollInFlight) return;
+    healthPollInFlight = true;
+    try { await pollHealth(); } finally { healthPollInFlight = false; }
+  };
+
   const scheduleHealth = () => {
     if (healthTimer) clearInterval(healthTimer);
-    healthTimer = setInterval(() => void pollHealth(), 2_000);
+    healthTimer = setInterval(() => void guardedPoll(), 2_000);
     healthTimer.unref?.();
   };
 
@@ -227,7 +254,7 @@ export function createTunnelSupervisor(options: {
   };
 
   const spawnManaged = async (): Promise<void> => {
-    if (stopping || !managed || !configured || child) return;
+    if (stopping || !managed || !configured || child || externalObserved) return;
     const executable = tunnelExecutable(root);
     if (!executable) {
       status = "degraded";
@@ -236,8 +263,12 @@ export function createTunnelSupervisor(options: {
     }
     try {
       const profile = await writeProfile(root, options.mcpPort, healthPort, tunnelId);
+      if (stopping) return;
       reusedExternal = false;
       healthMisses = 0;
+      childReady = false;
+      terminating = false;
+      childStartedMs = Date.now();
       status = "starting";
       startedAt = new Date().toISOString();
       lastError = null;
@@ -276,7 +307,7 @@ export function createTunnelSupervisor(options: {
         scheduleRestart(spawnManaged);
       });
       scheduleHealth();
-      void pollHealth();
+      void guardedPoll();
     } catch (error) {
       child = null;
       lastError = error instanceof Error ? error.message : String(error);
@@ -294,8 +325,11 @@ export function createTunnelSupervisor(options: {
       status = "not_configured";
       return;
     }
+    if (child || healthTimer || restartTimer) return;
     stopping = false;
     if (await ready(healthPort)) {
+      if (stopping) return;
+      externalObserved = true;
       if (await profileMatchesExpected(root, options.mcpPort, healthPort, tunnelId)) {
         reusedExternal = true;
         status = "online";
@@ -310,7 +344,9 @@ export function createTunnelSupervisor(options: {
       scheduleHealth();
       return;
     }
+    if (stopping) return;
     reusedExternal = false;
+    externalObserved = false;
     await spawnManaged();
   };
 

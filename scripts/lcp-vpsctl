@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Root-owned host-local controller; retain the existing phone forced-command interface.
+set -euo pipefail
+export PATH=/usr/local/bin:/usr/bin:/bin
+[[ "$(id -u)" -eq 0 ]] || { echo "Run with sudo" >&2; exit 2; }
+backend=lcp-vps.service
+tunnel=lcp-vps-tunnel.service
+queue=lcp-agent-queue.service
+push_socket=lcp-git-push-broker.socket
+push_service=lcp-git-push-broker.service
+health=/usr/local/libexec/lcp-vps-health.py
+
+status() {
+  local unit state boot
+  for unit in "$backend" "$tunnel" "$queue" "$push_socket"; do
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    boot="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    echo "$unit: state=$state boot=$boot"
+  done
+  if systemctl is-active --quiet "$backend"; then
+    "$health" mcp && echo 'lcp_health=ok' || echo 'lcp_health=not_ready'
+  fi
+  if systemctl is-active --quiet "$tunnel"; then
+    "$health" tunnel && echo 'tunnel_ready=ok (polling confirmed)' || echo 'tunnel_ready=not_ready'
+  fi
+}
+ensure_tunnel() {
+  systemctl enable --now "$tunnel"
+  if ! "$health" tunnel; then
+    # A previously active unit can be degraded even though enable --now succeeded.
+    systemctl restart "$tunnel"
+  fi
+  "$health" wait-tunnel
+}
+apply() {
+  # Serialize control operations, including phone retries, within a root-only lock.
+  exec 9>/run/lcp-vps-control.lock
+  flock -x 9
+  case "$1" in
+    on)
+      systemctl enable --now "$push_socket"
+      systemctl enable --now "$queue"
+      systemctl enable --now "$backend"
+      "$health" wait-mcp
+      ensure_tunnel
+      ;;
+    off)
+      systemctl stop "$push_service" || true
+      systemctl disable --now "$tunnel"
+      systemctl disable --now "$backend" "$queue" "$push_socket"
+      ;;
+    pause) systemctl disable --now "$tunnel" ;;
+    resume)
+      systemctl is-active --quiet "$backend" || { echo 'LCP backend is off; use on' >&2; exit 3; }
+      "$health" wait-mcp
+      ensure_tunnel
+      ;;
+    restart)
+      systemctl is-active --quiet "$backend" || { echo 'LCP backend is off; use on' >&2; exit 3; }
+      local restore=no
+      if systemctl is-enabled --quiet "$tunnel"; then restore=yes; fi
+      systemctl stop "$tunnel"
+      systemctl restart "$backend"
+      "$health" wait-mcp
+      if [[ "$restore" == yes ]]; then ensure_tunnel; fi
+      ;;
+    *) exit 2 ;;
+  esac
+  status
+}
+case "${1:-}" in
+  on|off|pause|resume|restart)
+    [[ $# == 1 ]] || exit 2
+    # The transient service belongs to PID 1, not SSH. If the phone disconnects
+    # after enqueueing, the fixed operation continues; --wait reports its result.
+    systemd-run --quiet --wait --collect --unit="lcp-vps-control-$$" \
+      --property=Type=oneshot --property=TimeoutStartSec=600 \
+      /usr/local/sbin/lcp-vpsctl apply "$1"
+    status
+    ;;
+  apply) [[ $# == 2 ]] || exit 2; apply "$2" ;;
+  status) [[ $# == 1 ]] || exit 2; status ;;
+  logs) [[ $# == 1 ]] || exit 2; journalctl -u "$backend" -u "$tunnel" -u "$queue" -u "$push_service" -n 60 --no-pager ;;
+  *) echo 'Usage: lcp-vpsctl {on|off|pause|resume|restart|status|logs}' >&2; exit 2 ;;
+esac
