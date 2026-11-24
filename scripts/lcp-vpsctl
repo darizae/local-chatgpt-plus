@@ -62,7 +62,10 @@ apply() {
       systemctl stop "$tunnel"
       systemctl restart "$backend"
       "$health" wait-mcp
-      if [[ "$restore" == yes ]]; then ensure_tunnel; fi
+      if [[ "$restore" == yes ]]; then
+        systemctl start "$tunnel"
+        "$health" wait-tunnel
+      fi
       ;;
     *) exit 2 ;;
   esac

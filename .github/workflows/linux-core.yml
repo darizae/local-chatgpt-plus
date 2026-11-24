@@ -40,6 +40,9 @@ jobs:
       - name: Linux-compatible OAuth and runtime regression tests
         run: pnpm run test:linux
 
+      - name: VPS reliability and bounded maintenance regressions
+        run: pnpm run test:vps
+
       - name: Audit production dependencies
         run: pnpm audit --prod
 

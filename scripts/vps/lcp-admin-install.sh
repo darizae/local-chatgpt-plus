@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Run once from a reviewed ROOT-OWNED snapshot, never directly from an MCP-writable checkout.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+[[ "$(id -u)" == 0 ]] || { echo 'Authorized host administrator required.' >&2; exit 2; }
+[[ $# == 0 || ( $# == 1 && "$1" == --use-example-policy ) ]] || exit 2
+src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ "$src" == /root/lcp-reviewed/scripts/vps ]] || { echo 'Use the reviewed root-owned staging directory.' >&2; exit 2; }
+# Never trust an executable or configuration that the coding account can modify.
+for f in /root/lcp-reviewed /root/lcp-reviewed/scripts "$src" "$src"/* "$src"/../lcp-vps*; do
+  [[ ! -L "$f" && "$(stat -c %u "$f")" == 0 ]]
+  mode="$(stat -c %a "$f")"
+  (( (8#$mode & 022) == 0 ))
+done
+queue=lcp-agent-queue.service
+broker=lcp-agent-broker.service
+socket=lcp-maintenance.socket
+[[ "$(systemctl show "$queue" -p User --value)" == agent ]]
+[[ "$(systemctl show "$broker" -p User --value)" == agent ]]
+[[ "$(systemctl show "$queue" -p FragmentPath --value)" == "/etc/systemd/system/$queue" ]]
+[[ "$(systemctl show "$broker" -p FragmentPath --value)" == "/etc/systemd/system/$broker" ]]
+queue_on="$(systemctl is-active "$queue" || true)"
+broker_on="$(systemctl is-active "$broker" || true)"
+socket_on="$(systemctl is-active "$socket" || true)"
+socket_enabled="$(systemctl is-enabled "$socket" 2>/dev/null || true)"
+for state in "$queue_on" "$broker_on" "$socket_on"; do
+  [[ "$state" == active || "$state" == inactive ]] || { echo 'Service state is not stable; inspect first.' >&2; exit 1; }
+done
+
+backup="$(mktemp -d /var/backups/lcp-admin.XXXXXXXX)"
+sources=(lcp-agent-queue lcp-agent-queue-broker lcp-native-subagent lcp-agent-queue-client lcp-agent-queue-root.conf lcp-maintenance lcp-maintenance-client lcp-maintenance.socket lcp-maintenance@.service lcp-maintenance-tmpfiles.conf)
+destinations=(/usr/local/libexec/lcp-agent-queue /usr/local/libexec/lcp-agent-queue-broker /usr/local/bin/lcp-native-subagent /usr/local/bin/lcp-agent-queue-client /etc/systemd/system/lcp-agent-queue.service.d/50-lcp-maintenance.conf /usr/local/libexec/lcp-maintenance /usr/local/bin/lcp-maintenance-client /etc/systemd/system/lcp-maintenance.socket /etc/systemd/system/lcp-maintenance@.service /etc/tmpfiles.d/lcp-maintenance.conf)
+modes=(0755 0755 0755 0755 0644 0755 0755 0644 0644 0644)
+policy=/etc/lcp-vps/agent-queue-policy.json
+if [[ "${1:-}" == --use-example-policy && ! -e "$policy" ]]; then
+  sources+=(agent-queue-policy.example.json)
+  destinations+=("$policy")
+  modes+=(0644)
+fi
+for i in "${!destinations[@]}"; do
+  if [[ -e "${destinations[i]}" ]]; then cp -a -- "${destinations[i]}" "$backup/$i"; fi
+done
+printf '%s\n' "${destinations[@]}" >"$backup/targets"
+echo "Maintenance backup: $backup"
+
+restore_states() {
+  if [[ "$socket_on" == active ]]; then systemctl start "$socket"; fi
+  if [[ "$queue_on" == active ]]; then systemctl start "$queue"; fi
+  if [[ "$broker_on" == active ]]; then systemctl start "$broker"; fi
+}
+rollback() {
+  local rc=$?
+  trap - EXIT
+  if (( rc == 0 )); then return; fi
+  set +e
+  echo "Maintenance installation failed; restoring queue and broker artifacts from $backup." >&2
+  systemctl stop "$socket" "$broker" "$queue"
+  if [[ "$socket_enabled" != enabled ]]; then systemctl disable "$socket"; fi
+  for i in "${!destinations[@]}"; do
+    if [[ -e "$backup/$i" ]]; then cp -a -- "$backup/$i" "${destinations[i]}"; else rm -f -- "${destinations[i]}"; fi
+  done
+  systemctl daemon-reload
+  restore_states
+  exit "$rc"
+}
+
+# Stop submissions, then verify no pending jobs before restarting the worker.
+systemctl stop "$broker"
+if ! /usr/sbin/runuser -u agent -- /usr/bin/python3 -I -c '
+import glob,json,sys
+for name in glob.glob("/home/agent/workspaces/tasks/*/state.json"):
+    with open(name) as f: job=json.load(f)
+    if job.get("state") in ("queued","running"): sys.exit(1)
+'; then
+  if [[ "$broker_on" == active ]]; then systemctl start "$broker"; fi
+  echo 'Queue not idle or unreadable; do not interrupt active model jobs.' >&2
+  exit 1
+fi
+trap rollback EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+systemctl stop "$queue" "$socket" 2>/dev/null || systemctl stop "$queue"
+install -d -m 0755 /usr/local/libexec /etc/lcp-vps /etc/systemd/system/lcp-agent-queue.service.d /etc/tmpfiles.d
+for i in "${!sources[@]}"; do
+  install -o root -g root -m "${modes[i]}" "$src/${sources[i]}" "${destinations[i]}"
+done
+systemd-tmpfiles --create /etc/tmpfiles.d/lcp-maintenance.conf
+systemctl daemon-reload
+systemd-analyze verify "$queue" "$broker" "$socket" lcp-maintenance@.service
+# Install the previous tunnel-readiness migration first. Its own rollback is separate.
+bash "$src/../lcp-vps-install.sh"
+systemctl enable --now "$socket"
+if [[ "$queue_on" == active ]]; then systemctl start "$queue"; fi
+if [[ "$broker_on" == active ]]; then systemctl start "$broker"; fi
+/usr/sbin/runuser -u agent -- /usr/local/bin/lcp-maintenance-client status
+if [[ "$broker_on" == active ]]; then /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-agent-queue-client capacity; fi
+trap - EXIT INT TERM
+echo 'Host bootstrap complete. Routine application restart now uses the fixed maintenance socket.'

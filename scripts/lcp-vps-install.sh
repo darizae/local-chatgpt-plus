@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Operator-only migration. Review the committed files before running as root.
+# Operator-only migration from the reviewed root-owned staging directory.
 # Does not read or replace environment files, tunnel credentials, or sudo policy.
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -7,6 +7,12 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [[ $# == 0 ]] || { echo 'Usage: lcp-vps-install.sh' >&2; exit 2; }
 umask 077
 src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ "$src" == /root/lcp-reviewed/scripts ]] || { echo "Use the reviewed root-owned staging directory; see docs/LINUX_VPS_OPERATIONS.md." >&2; exit 2; }
+for f in /root/lcp-reviewed "$src" "$src"/lcp-vps*; do
+  [[ ! -L "$f" && "$(stat -c %u "$f")" == 0 ]]
+  mode="$(stat -c %a "$f")"
+  (( (8#$mode & 022) == 0 ))
+done
 backend=lcp-vps.service
 tunnel=lcp-vps-tunnel.service
 units=/etc/systemd/system
@@ -32,7 +38,7 @@ mapfile -t commands < <(sed -n 's/^ExecStart=//p' "$units/$tunnel")
 [[ ${#commands[@]} == 1 && "${commands[0]}" == '/home/agent/.local/bin/tunnel-client run --profile lcp-vps '* ]] || {
   echo 'Unexpected tunnel command; review manually.' >&2; exit 1;
 }
-[[ -f "$src/../dist/index.js" ]] || { echo 'Build the checkout as agent first.' >&2; exit 1; }
+[[ -f /home/agent/workspaces/projects/local-chatgpt-plus/dist/index.js ]] || { echo 'Build the checkout as agent first.' >&2; exit 1; }
 
 backend_state="$(systemctl show "$backend" -p ActiveState --value)"
 tunnel_state="$(systemctl show "$tunnel" -p ActiveState --value)"

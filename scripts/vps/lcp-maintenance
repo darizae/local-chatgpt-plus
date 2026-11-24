@@ -1,0 +1,151 @@
+#!/usr/bin/python3 -I
+"""Root-owned socket-activated controller for ONE fixed action, no arbitrary execution."""
+import fcntl
+import http.client
+import json
+import os
+import pathlib
+import pwd
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+STATE = pathlib.Path("/var/lib/lcp-maintenance")
+CONTROLLER = "/usr/local/sbin/lcp-vpsctl"
+BACKEND = "lcp-vps.service"
+TUNNEL = "lcp-vps-tunnel.service"
+COMMIT = re.compile(r"[0-9a-f]{12}\Z")
+RECEIPT = re.compile(r"[0-9a-f]{32}\Z")
+MAX_REQUEST = 1024
+
+def validate(req):
+    if not isinstance(req, dict):
+        raise ValueError("invalid request")
+    if req == {"action": "status"}:
+        return
+    if (set(req) != {"action", "commit", "receipt"} or req["action"] != "restart" or
+            not isinstance(req["commit"], str) or not COMMIT.fullmatch(req["commit"]) or
+            not isinstance(req["receipt"], str) or not RECEIPT.fullmatch(req["receipt"])):
+        raise ValueError("only fixed restart(commit, receipt) and status are supported")
+
+def read_state():
+    try:
+        with (STATE / "status.json").open() as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return {"state": "idle"}
+
+def persist(value):
+    path = STATE / ".status.next"
+    with path.open("w") as handle:
+        json.dump(value, handle)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    path.chmod(0o644)
+    os.replace(path, STATE / "status.json")
+
+def call(*args):
+    return subprocess.run(list(args), check=True, timeout=480,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"})
+
+def unit(unit_name):
+    out = call("/usr/bin/systemctl", "show", unit_name,
+               "-p", "ActiveState", "-p", "MainPID").stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+def current_health():
+    conn = http.client.HTTPConnection("127.0.0.1", 8766, timeout=3)
+    try:
+        conn.request("GET", "/health")
+        with conn.getresponse() as response:
+            if response.status != 200:
+                raise ValueError("backend unhealthy")
+            data = json.loads(response.read(128 * 1024))
+            if data.get("status") != "ok" or data.get("authMode") != "oauth":
+                raise ValueError("backend unhealthy")
+            if data.get("buildCommit") != data.get("artifactCommit"):
+                raise ValueError("compiled artifact does not match checkout")
+            return data.get("artifactCommit"), data.get("runId")
+    finally:
+        conn.close()
+
+def restart(req, respond):
+    # State and lock are root-owned, not paths from a client.
+    with (STATE / "restart.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            respond({"ok": False, "code": "maintenance_busy"})
+            return
+        old = read_state()
+        if old.get("receipt") == req["receipt"]:
+            respond({"ok": True, **old})
+            return
+        if time.time() - old.get("started", 0) < 60:
+            respond({"ok": False, "code": "restart_cooldown"})
+            return
+        before_backend, before_tunnel = unit(BACKEND), unit(TUNNEL)
+        if before_backend.get("ActiveState") != "active" or before_tunnel.get("ActiveState") != "active":
+            respond({"ok": False, "code": "service_not_on"})
+            return
+        record = {"state": "accepted", "receipt": req["receipt"], "commit": req["commit"],
+                  "started": time.time(), "old_backend_pid": before_backend.get("MainPID"),
+                  "old_tunnel_pid": before_tunnel.get("MainPID")}
+        persist(record)
+        # Acknowledge before stopping the transport. Broken pipe is not cancellation.
+        respond({"ok": True, **record})
+        record["state"] = "running"
+        persist(record)
+        try:
+            # Fixed root-owned controller, which serializes with the phone ON/OFF lock.
+            # No client-provided argv, environment, service names, or executable paths.
+            call(CONTROLLER, "apply", "restart")
+            after_backend, after_tunnel = unit(BACKEND), unit(TUNNEL)
+            commit, run_id = current_health()
+            if (after_backend.get("ActiveState") != "active" or after_tunnel.get("ActiveState") != "active" or
+                    after_backend.get("MainPID") in ("0", record["old_backend_pid"], None) or
+                    after_tunnel.get("MainPID") in ("0", record["old_tunnel_pid"], None) or
+                    commit != req["commit"] or not isinstance(run_id, str)):
+                raise ValueError("runtime verification failed")
+            record.update(state="completed", backend_pid=after_backend["MainPID"],
+                          tunnel_pid=after_tunnel["MainPID"], runtime_commit=commit, run_id=run_id)
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            # Never echo command output, environment or secrets.
+            record.update(state="failed", code="restart_or_verification_failed")
+        record["finished"] = time.time()
+        persist(record)
+
+def serve(conn):
+    conn.settimeout(5)
+    peer = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    _, uid, _ = struct.unpack("3i", peer)
+    def respond(value):
+        try:
+            conn.sendall((json.dumps(value) + "\n").encode())
+        except OSError:
+            pass
+    if uid != pwd.getpwnam("agent").pw_uid:
+        respond({"ok": False, "code": "unauthorized"})
+        return
+    try:
+        stream = conn.makefile("rb")
+        line = stream.readline(MAX_REQUEST + 1)
+        if len(line) > MAX_REQUEST or not line.endswith(b"\n"):
+            raise ValueError("invalid request")
+        req = json.loads(line)
+        validate(req)
+        if req["action"] == "status":
+            respond({"ok": True, **read_state()})
+        else:
+            restart(req, respond)
+    except (ValueError, TypeError, OSError, subprocess.SubprocessError):
+        respond({"ok": False, "code": "invalid_or_unavailable"})
+
+if __name__ == "__main__":
+    with socket.socket(fileno=os.dup(0)) as conn:
+        serve(conn)

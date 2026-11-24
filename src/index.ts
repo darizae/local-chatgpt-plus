@@ -34,6 +34,7 @@ import {
 } from "./lib/permissions.js";
 import { shutdownSubagents } from "./lib/subagent-manager.js";
 import { initializeRuntimeIdentity } from "./lib/runtime-identity.js";
+import { readArtifactCommit } from "./lib/build-artifact.js";
 import { pruneEphemeralState } from "./lib/state-maintenance.js";
 import { createTunnelSupervisor } from "./lib/tunnel-supervisor.js";
 import { listSessionRuntimeStates } from "./lib/session-context.js";
@@ -121,6 +122,7 @@ console.log(
 );
 console.log(`[MCP] Tool profile: ${getChatGptToolProfile()} (CHATGPT_TOOL_PROFILE)`);
 const runtimeIdentity = initializeRuntimeIdentity(workspaceRoot);
+const artifactCommit = readArtifactCommit();
 console.log(`[MCP] Runtime: ${runtimeIdentity.run_id} schema=${runtimeIdentity.schema_hash} commit=${runtimeIdentity.build_commit || "unknown"}`);
 if (runtimeIdentity.connector_refresh_recommended) {
   console.warn("[MCP] Tool schema changed since the previous run; refresh the ChatGPT connector and use a fresh chat after this restart.");
@@ -264,6 +266,9 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     name: "local-chatgpt-plus",
+    buildCommit: runtimeIdentity.build_commit,
+    artifactCommit,
+    runId: runtimeIdentity.run_id,
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
     fullMachineAccess: getFullDiskAccess(),

@@ -1,0 +1,40 @@
+#!/usr/bin/python3 -I
+"""Unprivileged client for the fixed maintenance action; never accepts commands."""
+import argparse
+import json
+import re
+import socket
+import sys
+import uuid
+
+parser = argparse.ArgumentParser()
+sub = parser.add_subparsers(dest="action", required=True)
+restart = sub.add_parser("restart")
+restart.add_argument("--commit", required=True)
+restart.add_argument("--receipt", default=None)
+sub.add_parser("status")
+
+def main():
+    args = parser.parse_args()
+    req = {"action": args.action}
+    if args.action == "restart":
+        if not re.fullmatch(r"[0-9a-f]{12}", args.commit):
+            parser.error("commit must be a 12-character Git SHA")
+        receipt = args.receipt or uuid.uuid4().hex
+        if not re.fullmatch(r"[0-9a-f]{32}", receipt):
+            parser.error("invalid receipt")
+        req.update(commit=args.commit, receipt=receipt)
+    try:
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(8)
+            conn.connect("/run/lcp-maintenance/agent.sock")
+            conn.sendall((json.dumps(req) + "\n").encode())
+            reply = json.loads(conn.makefile("rb").readline(8192))
+    except (OSError, ValueError):
+        print("Maintenance socket unavailable; administrator bootstrap required", file=sys.stderr)
+        return 2
+    print(json.dumps(reply))
+    return 0 if reply.get("ok") else 2
+
+if __name__ == "__main__":
+    sys.exit(main())
