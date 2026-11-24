@@ -3,7 +3,8 @@ import * as pty from "node-pty";
 import type { IPty } from "node-pty";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
-import { requireCommandAllowed, requireUnsafeRuntimeAllowed } from "../lib/permissions.js";
+import { requireCommandAllowed, requireDevelopmentCapability } from "../lib/permissions.js";
+import { developmentChildEnvironment } from "../lib/development-env.js";
 import { getShellStatus } from "../lib/persistent-shell.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
@@ -61,10 +62,7 @@ function stripAnsi(value: string): string {
 }
 
 function ptyEnvironment(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === "string") env[key] = value;
-  }
+  const env = developmentChildEnvironment(process.env);
   env.TERM = env.TERM || "xterm-256color";
   return env;
 }
@@ -180,10 +178,10 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
       }
 
       if (action === "start") {
-        requireUnsafeRuntimeAllowed("PTY session");
         const cwd = working_directory
           ? await validatePath(working_directory)
           : getShellStatus().cwd || defaultCwd;
+        requireDevelopmentCapability("pty", cwd);
         const projectRoot = await canonicalProjectRootForPath(cwd);
         if (command) requireCommandAllowed(command, cwd);
         const spec = shellSpec(command);
@@ -268,7 +266,7 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
         if (!scope?.scoped) {
           throw new Error(`workspace is required to control PTY ${id} from an unbound MCP transport.`);
         }
-        requireUnsafeRuntimeAllowed("PTY input");
+        requireDevelopmentCapability("pty", item.cwd);
         if (input === undefined) throw new Error("input is required for PTY write");
         const payload = append_newline ? `${input}\r` : input;
         item.terminal.write(payload);

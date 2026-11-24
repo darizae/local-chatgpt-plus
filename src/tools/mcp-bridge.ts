@@ -4,7 +4,7 @@ import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
-import { requireUnsafeRuntimeAllowed, requireWriteAllowed } from "../lib/permissions.js";
+import { requireDevelopmentCapability, requireWriteAllowed } from "../lib/permissions.js";
 
 export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamManager): void {
   server.registerTool(
@@ -73,7 +73,7 @@ export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamMa
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ server_id, tool, arguments: args }) => {
-      requireUnsafeRuntimeAllowed(`upstream MCP tool '${server_id}:${tool}'`);
+      requireDevelopmentCapability("upstream");
       requireWriteAllowed();
       const config = manager.getServerConfig(server_id);
       if (!config) throw new Error(`Unknown server_id: ${server_id}`);
