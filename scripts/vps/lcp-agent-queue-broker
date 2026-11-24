@@ -15,7 +15,7 @@ QUEUE = '/usr/local/libexec/lcp-agent-queue'
 TASKS = pathlib.Path('/home/agent/workspaces/tasks')
 ENV = {'PATH': '/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin',
        'HOME': '/home/agent', 'LANG': 'C.UTF-8'}
-MAX_WIRE_BYTES = 14_000
+MAX_WIRE_BYTES = 300_000
 HEX_ID = re.compile(r'[0-9a-f]{32}\Z')
 REPO = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}\Z')
 
@@ -61,38 +61,41 @@ def dispatch(req):
             raise ValueError('Unexpected capacity parameters')
         result = json.loads(queue_call(['capacity']))
         fields = ('active_jobs', 'model_jobs_24h', 'reserved_cost_usd_24h',
-                  'max_model_jobs_24h', 'max_reserved_cost_usd_24h', 'max_queued_jobs',
-                  'next_model_slot_in_seconds')
+                  'max_queued_jobs', 'max_job_cost_usd', 'max_job_seconds')
         values = {key: result[key] for key in fields}
         if any(type(value) not in (int, float) or not math.isfinite(value) for value in values.values()):
             raise ValueError('Invalid capacity response')
-        return {'ok': True, **values}
+        if result.get('max_model_jobs_24h') is not None or result.get('max_reserved_cost_usd_24h') is not None:
+            raise ValueError('Unexpected rolling quota')
+        return {'ok': True, **values, 'max_model_jobs_24h': None, 'max_reserved_cost_usd_24h': None}
     if op == 'submit':
         repo, prompt = req.get('repo'), req.get('prompt')
         engine = req.get('engine', 'omp')
-        seconds, cost = req.get('seconds', 90), req.get('cost', 0.05)
+        seconds, cost = req.get('seconds', 900), req.get('cost', 1.0)
         if not isinstance(repo, str) or not REPO.fullmatch(repo) or repo.startswith('.'):
             raise ValueError('Invalid repository name')
-        if not isinstance(prompt, str) or not 1 <= len(prompt) <= 6_000 or '\x00' in prompt:
-            raise ValueError('Prompt must be 1..6000 characters')
+        if not isinstance(prompt, str) or not 1 <= len(prompt) <= 24_000 or '\x00' in prompt:
+            raise ValueError('Prompt must be 1..24000 characters')
         if engine not in ('omp', 'omp-readonly', 'selftest'):
             raise ValueError('Unsupported engine')
-        if type(seconds) is not int or not 10 <= seconds <= 120:
-            raise ValueError('Seconds must be 10..120')
-        if isinstance(cost, bool) or not isinstance(cost, (float, int)) or not 0.01 <= cost <= 0.05:
-            raise ValueError('Per-job cost cap must be $0.01..$0.05')
+        if type(seconds) is not int or not 10 <= seconds <= 1800:
+            raise ValueError('Seconds must be 10..1800')
+        if isinstance(cost, bool) or not isinstance(cost, (float, int)) or not 0.01 <= cost <= 5.0:
+            raise ValueError('Per-job cost cap must be $0.01..$5.00')
         args = ['submit', '--repo', repo, '--engine', engine, '--seconds', str(seconds),
                 '--cost', str(cost)]
         submitted = json.loads(queue_call(args, prompt))
         return {'ok': True, 'id': submitted['id'], 'state': submitted['state'],
-                'repo': repo, 'engine': engine, 'max_cost_usd': cost, 'seconds': seconds}
+                'repo': repo, 'engine': engine, 'max_cost_usd': cost, 'seconds': seconds,
+                'base_commit': submitted.get('base_commit'), 'parent_dirty': submitted.get('parent_dirty', False)}
     job_id = req.get('id')
     if not isinstance(job_id, str) or not HEX_ID.fullmatch(job_id):
         raise ValueError('Invalid job identifier')
     if op == 'status':
         item = json.loads(queue_call(['status', job_id]))
         return {'ok': True, 'id': job_id, 'state': item.get('state'),
-                'exit_code': item.get('exit_code'), 'max_cost_usd': item.get('max_cost_usd')}
+                'exit_code': item.get('exit_code'), 'max_cost_usd': item.get('max_cost_usd'),
+                'base_commit': item.get('base_commit'), 'worktree': item.get('worktree')}
     if op == 'cancel':
         item = json.loads(queue_call(['cancel', job_id]))
         return {'ok': True, 'id': job_id, 'cancellation_requested': item.get('cancellation_requested')}
@@ -121,7 +124,7 @@ def dispatch(req):
                 value = '\n'.join(block.get('text', '') for block in blocks
                                   if isinstance(block, dict) and block.get('type') == 'text')
                 if value.strip():
-                    last = value[:2_000]
+                    last = value[:12_000]
             except (ValueError, TypeError, AttributeError):
                 continue
         return {'ok': True, 'id': job_id, 'state': item.get('state'),

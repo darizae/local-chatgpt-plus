@@ -19,15 +19,15 @@ active_id = None
 
 def ask(request):
     raw = (json.dumps(request, ensure_ascii=True) + '\n').encode('utf-8')
-    if len(raw) > 14_000:
+    if len(raw) > 300_000:
         raise ValueError('Broker request exceeds permitted size')
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(8)
         s.connect(SOCKET)
         s.sendall(raw)
         with s.makefile('rb') as stream:
-            result = stream.readline(16000)
-    if not result or len(result) >= 16000:
+            result = stream.readline(200000)
+    if not result or len(result) >= 200000:
         raise ValueError('Broker sent no bounded response')
     data = json.loads(result)
     if not isinstance(data, dict) or data.get('ok') is not True:
@@ -63,13 +63,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--capacity', action='store_true', help='Read bounded queue capacity without submitting a job')
     parser.add_argument('--engine', choices=['omp', 'omp-readonly'], default='omp-readonly')
-    parser.add_argument('--seconds', type=int, default=90)
-    parser.add_argument('--cost', type=float, default=0.05)
+    parser.add_argument('--seconds', type=int, default=900)
+    parser.add_argument('--cost', type=float, default=1.0)
     args = parser.parse_args()
     if args.capacity:
         print(json.dumps(ask({'action': 'capacity'})))
         return 0
-    if not 10 <= args.seconds <= 120 or not 0.01 <= args.cost <= 0.05:
+    if not 10 <= args.seconds <= 1800 or not 0.01 <= args.cost <= 5.0:
         parser.error('Hard bounded duration/cost limits exceeded')
     directory = Path.cwd().resolve()
     try:
@@ -79,9 +79,9 @@ def main():
     if len(relative.parts) != 1 or not REPO.fullmatch(relative.parts[0]) or relative.parts[0].startswith('.'):
         parser.error('Expected a direct, named Git repository under project root')
     repo = relative.parts[0]
-    prompt = sys.stdin.read(6002)
-    if not 1 <= len(prompt) <= 6000 or not prompt.strip():
-        parser.error('Prompt must be nonempty, at most 6000 characters')
+    prompt = sys.stdin.read(24001)
+    if not 1 <= len(prompt) <= 24000 or not prompt.strip():
+        parser.error('Prompt must be nonempty, at most 24000 characters')
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     receipt = ask({'action': 'submit', 'repo': repo, 'prompt': prompt,
@@ -89,14 +89,22 @@ def main():
     active_id = receipt.get('id')
     if not isinstance(active_id, str) or not JOB.fullmatch(active_id):
         raise ValueError('Invalid broker job receipt')
-    deadline = time.monotonic() + args.seconds + 20
-    while time.monotonic() < deadline:
+    print(json.dumps({"broker_job_id": active_id, "base_commit": receipt.get("base_commit"),
+                      "parent_dirty": receipt.get("parent_dirty", False)}), flush=True)
+    if receipt.get("parent_dirty"):
+        print("Isolated worktree uses committed HEAD only; uncommitted parent changes are excluded.", flush=True)
+    deadline = None
+    queue_deadline = time.monotonic() + 12 * 3600
+    while time.monotonic() < (deadline if deadline is not None else queue_deadline):
         state = ask({'action': 'status', 'id': active_id})
+        if state.get('state') == 'running' and deadline is None:
+            deadline = time.monotonic() + args.seconds + 25
         if state.get('state') not in ('queued', 'running'):
             output = ask({'action': 'result', 'id': active_id})
             candidate = output.get('untrusted_model_output')
             if isinstance(candidate, str):
-                print(candidate[:2000], flush=True)
+                print(candidate[:12000], flush=True)
+            print(json.dumps({"broker_job_id": active_id, "worktree": state.get("worktree"), "base_commit": state.get("base_commit")}), flush=True)
             if state.get('state') == 'completed' and state.get('exit_code') == 0:
                 print('BOUNDED_SUBAGENT_COMPLETED', flush=True)
                 return 0

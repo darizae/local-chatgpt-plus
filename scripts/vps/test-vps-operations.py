@@ -30,29 +30,62 @@ def job(created=NOW - 100, engine="omp", state="completed", cost=0.05):
     return {"created": created, "engine": engine, "state": state, "max_cost_usd": cost}
 
 class QueueTests(unittest.TestCase):
-    def test_old_quota_reproduced(self):
-        jobs = [job(state=state) for state in ["completed", "completed", "completed", "failed"]]
-        with self.assertRaises(queue.QueueRejected) as ctx:
-            queue.check_capacity(jobs, queue.DEFAULT_POLICY, "omp", 0.05, NOW)
-        self.assertEqual(ctx.exception.code, "daily_job_limit")
-        self.assertEqual(ctx.exception.retry_after_seconds, 86301)
-        self.assertEqual(queue.capacity(jobs, queue.DEFAULT_POLICY, NOW)["active_jobs"], 0)
+    def test_no_rolling_job_or_cost_quota(self):
+        jobs = [job(state="completed", cost=5)] * 1000 + [job(state="failed", cost=5)] * 100
+        queue.check_capacity(jobs, queue.DEFAULT_POLICY, "omp", 5, NOW)
+        state = queue.capacity(jobs, queue.DEFAULT_POLICY, NOW)
+        self.assertEqual(state["model_jobs_24h"], 1100)
+        self.assertEqual(state["reserved_cost_usd_24h"], 5500)
+        self.assertIsNone(state["max_model_jobs_24h"])
+        self.assertIsNone(state["max_reserved_cost_usd_24h"])
 
-    def test_policy_allows_more_without_weakening_per_job_caps(self):
-        policy = json.loads((ROOT / "agent-queue-policy.example.json").read_text())
-        jobs = [job()] * 4
-        queue.check_capacity(jobs, policy, "omp", 0.05, NOW)
-        with self.assertRaises(queue.QueueRejected) as ctx:
-            queue.check_capacity([job(cost=0.2)] * 5, policy, "omp", 0.05, NOW)
-        self.assertEqual(ctx.exception.code, "daily_cost_limit")
+    def test_legacy_policy_cannot_restore_rolling_quotas(self):
+        policy = {"max_queued_jobs": 32, "max_model_jobs_24h": 1, "max_reserved_cost_usd_24h": 0.01}
+        queue.check_capacity([job(cost=5)] * 100, policy, "omp", 5, NOW)
+        state = queue.capacity([], policy, NOW)
+        self.assertIsNone(state["max_model_jobs_24h"])
+        self.assertIsNone(state["max_reserved_cost_usd_24h"])
 
-    def test_rolling_window_and_selftest(self):
+    def test_only_inflight_queue_backpressure_remains(self):
         policy = queue.DEFAULT_POLICY
-        queue.check_capacity([job(created=NOW - 86400)] * 5, policy, "omp", 0.05, NOW)
-        queue.check_capacity([job()] * 4, policy, "selftest", 0.05, NOW)
+        queue.check_capacity([job(state="queued")] * 31, policy, "omp", 5, NOW)
         with self.assertRaises(queue.QueueRejected) as ctx:
-            queue.check_capacity([job(state="running")] * 8, policy, "selftest", 0.05, NOW)
+            queue.check_capacity([job(state="queued")] * 32, policy, "selftest", 0.05, NOW)
         self.assertEqual(ctx.exception.code, "queue_full")
+
+    def test_broker_increased_cost_runtime_and_prompt(self):
+        req = {"action":"submit","repo":"example","prompt":"a"*24000,"seconds":1800,"cost":5,"engine":"omp"}
+        result = {"id":"a"*32,"state":"queued","base_commit":"b"*40,"parent_dirty":True}
+        with patch.object(broker, "queue_call", return_value=json.dumps(result)) as call:
+            reply = broker.dispatch(req)
+            self.assertEqual(reply["max_cost_usd"], 5)
+            self.assertEqual(reply["seconds"], 1800)
+            self.assertTrue(reply["parent_dirty"])
+            self.assertEqual(reply["base_commit"], "b"*40)
+            self.assertIn("5", call.call_args.args[0])
+        for invalid in [{"cost":5.01},{"seconds":1801},{"prompt":"a"*24001}]:
+            with self.assertRaises(ValueError):
+                broker.dispatch({**req,**invalid})
+
+    def test_dirty_repository_admitted_at_pinned_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            projects = root / "projects"
+            repo = projects / "example"
+            (repo / ".git").mkdir(parents=True)
+            tasks = root / "tasks"
+            tasks.mkdir()
+            args = MagicMock(engine="omp",seconds=900,cost=1,repo="example")
+            head = subprocess.CompletedProcess([], 0, "b"*40 + "\n", "")
+            status = subprocess.CompletedProcess([], 0, " M file.txt\n", "")
+            with patch.object(queue,"PROJECTS",projects), patch.object(queue,"TASKS",tasks), patch.object(queue,"LOCK",tasks/".lock"), patch.object(queue,"git",side_effect=[head,status]), patch.object(queue,"load_policy",return_value=queue.DEFAULT_POLICY), patch.object(queue.sys,"stdin",io.StringIO("review")), patch.object(queue.sys,"stdout",io.StringIO()) as stdout:
+                queue.submit(args)
+                receipt = json.loads(stdout.getvalue())
+            self.assertTrue(receipt["parent_dirty"])
+            self.assertEqual(receipt["base_commit"], "b"*40)
+            state = json.loads((tasks / receipt["id"] / "state.json").read_text())
+            self.assertEqual(state["base_commit"], "b"*40)
+            self.assertTrue(state["parent_dirty"])
 
     def test_broker_only_reflects_allowlisted_reason(self):
         response = subprocess.CompletedProcess([], 2, stdout=json.dumps({"code":"daily_job_limit","retry_after_seconds":42}), stderr="SECRET")
@@ -72,7 +105,11 @@ class QueueTests(unittest.TestCase):
     def test_capacity_no_submission(self):
         result = queue.capacity([job()] * 4, queue.DEFAULT_POLICY, NOW)
         with patch.object(broker, "queue_call", return_value=json.dumps(result)) as call:
-            self.assertEqual(broker.dispatch({"action":"capacity"})["model_jobs_24h"], 4)
+            response = broker.dispatch({"action":"capacity"})
+            self.assertEqual(response["model_jobs_24h"], 4)
+            self.assertIsNone(response["max_model_jobs_24h"])
+            self.assertIsNone(response["max_reserved_cost_usd_24h"])
+            self.assertEqual(response["max_job_cost_usd"], 5)
             call.assert_called_once_with(["capacity"])
         with self.assertRaises(ValueError):
             broker.dispatch({"action":"capacity","repo":"anything"})
