@@ -9,7 +9,7 @@ User=lcp-containers
 Group=lcp-containers
 Environment=HOME=/var/lib/lcp-containers
 Environment=XDG_RUNTIME_DIR=/run/lcp-containers
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RuntimeDirectory=lcp-containers
 RuntimeDirectoryMode=0700
 StateDirectory=lcp-containers
