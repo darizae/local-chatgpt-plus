@@ -114,7 +114,7 @@ class Jobs:
             self.save(r)
             self.records[jid]=r
             env={k:v for k,v in os.environ.items() if k in {
-                "HOME","USER","LOGNAME","PATH","SHELL","LANG","TZ","XDG_CACHE_HOME","XDG_DATA_HOME",
+                "HOME","USER","LOGNAME","PATH","SHELL","LANG","TZ","XDG_CACHE_HOME","XDG_DATA_HOME","XDG_CONFIG_HOME","MPLCONFIGDIR","DOCKER_CONFIG",
                 "npm_config_cache","PIP_CACHE_DIR","UV_CACHE_DIR","PLAYWRIGHT_BROWSERS_PATH","GIT_CONFIG_GLOBAL","DOCKER_HOST","SSL_CERT_FILE","SSL_CERT_DIR"} or re.fullmatch(r"LC_[A-Z_]+",k)}
             env.update(CI="true",PAGER="cat",GIT_PAGER="cat",NO_COLOR="1")
             try:
