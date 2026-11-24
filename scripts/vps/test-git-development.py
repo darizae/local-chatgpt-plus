@@ -2,6 +2,7 @@
 import importlib.machinery
 import importlib.util
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -54,4 +55,21 @@ class GitTests(unittest.TestCase):
             with patch.object(broker,"PROJECTS",root),patch.object(broker,"policy",return_value=("example",{},None)):
                 with self.assertRaisesRegex(ValueError,"credential not provisioned"):
                     broker.workspace(str(repo))
+    @unittest.skipUnless(shutil.which("git-lfs"),"Git LFS is not installed")
+    def test_lfs_trusted_staging_no_objects_and_custom_config_denial(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=pathlib.Path(d); repo=root/"repo"; repo.mkdir()
+            def git(*args):
+                return subprocess.check_output(["/usr/bin/git","-C",str(repo),*args],text=True)
+            git("init","-b","main"); git("config","user.name","Fixture"); git("config","user.email","fixture@example.invalid")
+            (repo/"readme.txt").write_text("fixture")
+            git("add","readme.txt"); git("commit","-m","fixture")
+            env={"HOME":d,"PATH":"/usr/bin:/bin","LANG":"C","GIT_CONFIG_NOSYSTEM":"1","GIT_CONFIG_GLOBAL":"/dev/null","GIT_ALLOW_PROTOCOL":"ssh"}
+            with patch.object(broker,"PROJECTS",root):
+                result=broker.lfs_transfer(repo,"git@github.com:example/demo.git",env,"lfs-fetch",False)
+                self.assertEqual(result["objects"],0)
+                (repo/".lfsconfig").write_text("[lfs]\nurl = https://example.invalid/lfs\n")
+                git("add",".lfsconfig"); git("commit","-m","custom fixture config")
+                with self.assertRaisesRegex(ValueError,"custom .lfsconfig"):
+                    broker.lfs_transfer(repo,"git@github.com:example/demo.git",env,"lfs-fetch",False)
 if __name__=="__main__": unittest.main(verbosity=2)
