@@ -33,9 +33,15 @@ for state in "$queue_on" "$broker_on" "$socket_on"; do
 done
 
 backup="$(mktemp -d /var/backups/lcp-admin.XXXXXXXX)"
-sources=(lcp-agent-queue lcp-agent-queue-broker lcp-native-subagent lcp-agent-queue-client lcp-agent-queue-root.conf lcp-maintenance lcp-maintenance-client lcp-maintenance.socket lcp-maintenance@.service lcp-maintenance-tmpfiles.conf lcp-git-push-broker lcp-git-sync)
-destinations=(/usr/local/libexec/lcp-agent-queue /usr/local/libexec/lcp-agent-queue-broker /usr/local/bin/lcp-native-subagent /usr/local/bin/lcp-agent-queue-client /etc/systemd/system/lcp-agent-queue.service.d/50-lcp-maintenance.conf /usr/local/libexec/lcp-maintenance /usr/local/bin/lcp-maintenance-client /etc/systemd/system/lcp-maintenance.socket /etc/systemd/system/lcp-maintenance@.service /etc/tmpfiles.d/lcp-maintenance.conf "$git_old" /usr/local/bin/lcp-git-sync)
-modes=(0755 0755 0755 0755 0644 0755 0755 0644 0644 0644 0755 0755)
+sources=(lcp-agent-queue lcp-agent-queue-broker lcp-native-subagent lcp-agent-queue-client lcp-agent-queue-root.conf lcp-maintenance lcp-maintenance-client lcp-maintenance.socket lcp-maintenance@.service lcp-maintenance-tmpfiles.conf lcp-git-push-broker lcp-git-sync lcp-durable-jobs lcp-durable-jobs.service)
+destinations=(/usr/local/libexec/lcp-agent-queue /usr/local/libexec/lcp-agent-queue-broker /usr/local/bin/lcp-native-subagent /usr/local/bin/lcp-agent-queue-client /etc/systemd/system/lcp-agent-queue.service.d/50-lcp-maintenance.conf /usr/local/libexec/lcp-maintenance /usr/local/bin/lcp-maintenance-client /etc/systemd/system/lcp-maintenance.socket /etc/systemd/system/lcp-maintenance@.service /etc/tmpfiles.d/lcp-maintenance.conf "$git_old" /usr/local/bin/lcp-git-sync /usr/local/libexec/lcp-durable-jobs /etc/systemd/system/lcp-durable-jobs.service)
+modes=(0755 0755 0755 0755 0644 0755 0755 0644 0644 0644 0755 0755 0755 0644)
+jobs_on="$(systemctl is-active lcp-durable-jobs.service || true)"
+jobs_enabled="$(systemctl is-enabled lcp-durable-jobs.service 2>/dev/null || true)"
+if [[ "$jobs_on" == active ]]; then
+  echo 'Durable supervisor already active; leave existing jobs intact. Review its upgrade separately.' >&2
+  exit 1
+fi
 # Preserve existing credentials, migrate the legacy hardcoded map without
 # executing the old broker or reading any SSH private key.
 if [[ ! -e "$git_policy" ]]; then
@@ -80,7 +86,8 @@ rollback() {
   if (( rc == 0 )); then return; fi
   set +e
   echo "Maintenance installation failed; restoring queue and broker artifacts from $backup." >&2
-  systemctl stop "$socket" "$broker" "$queue" "$git_socket" "$git_service"
+  systemctl stop "$socket" "$broker" "$queue" "$git_socket" "$git_service" lcp-durable-jobs.service
+  if [[ "$jobs_enabled" != enabled ]]; then systemctl disable lcp-durable-jobs.service; fi
   if [[ "$socket_enabled" != enabled ]]; then systemctl disable "$socket"; fi
   for i in "${!destinations[@]}"; do
     if [[ -e "$backup/$i" ]]; then cp -a -- "$backup/$i" "${destinations[i]}"; else rm -f -- "${destinations[i]}"; fi
@@ -116,7 +123,7 @@ for i in "${!sources[@]}"; do
 done
 systemd-tmpfiles --create /etc/tmpfiles.d/lcp-maintenance.conf
 systemctl daemon-reload
-systemd-analyze verify "$queue" "$broker" "$socket" lcp-maintenance@.service
+systemd-analyze verify "$queue" "$broker" "$socket" lcp-maintenance@.service lcp-durable-jobs.service
 # Keep package installs and browser downloads inside the existing writable
 # workspace. Creating these directories as agent avoids root-owned caches.
 /usr/sbin/runuser -u agent -- /usr/bin/mkdir -p /home/agent/workspaces/projects/.lcp-cache
@@ -132,6 +139,21 @@ for k in ("user.name","user.email"):
     if current.returncode==0: continue
     value=subprocess.check_output(["/usr/bin/git","-C",str(repo),"config","--local","--get",k],text=True).strip()
     subprocess.run(["/usr/bin/git","config","--file",str(target),k,value],check=True)
+'
+# Independent supervisor must be reachable before the new MCP starts.
+systemctl enable --now lcp-durable-jobs.service
+/usr/sbin/runuser -u agent -- /usr/bin/python3 -I -c '
+import json,socket,time
+for i in range(30):
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(2); s.connect("/run/lcp-durable-jobs/jobs.sock")
+            s.sendall(b"{\"action\":\"ping\"}\n")
+            r=json.loads(s.makefile("rb").readline())
+            if r.get("ok") and r.get("data",{}).get("ready"): break
+    except OSError: pass
+    time.sleep(1)
+else: raise SystemExit("Durable job supervisor readiness failed")
 '
 # Install the previous tunnel-readiness migration first. Its own rollback is separate.
 bash "$src/../lcp-vps-install.sh"

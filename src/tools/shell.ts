@@ -1,4 +1,5 @@
 import { recordTaskWorkerEvent } from "../lib/agent-task-store.js";
+import { durableJobsEnabled, durableRpc, isDurableJobId, assertDurableScope, waitDurable, type DurableJob } from "../lib/durable-jobs.js";
 import { safeWorkerFailureReason } from "../lib/worker-failure.js";
 import { isWorkspaceForTask, isAgentRunnerCommand, resolveWorkerTaskId } from "../lib/task-workspace.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
@@ -731,6 +732,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (linkedTaskId) {
         await assertTaskAllowsWorkingDirectory(linkedTaskId, cwd);
       }
+      if (durableJobsEnabled()) {
+        const job = await durableRpc<DurableJob>({action:"start", command, cwd, project_root:projectRoot,
+          task_id:linkedTaskId, label:label?.trim(), session_id:session?.session_id});
+        await audit({tool:"start_process",action:"start",target:cwd,status:"ok",details:{id:job.id,durable:true}});
+        return toolResult("start_process",job,{summary:`${job.reused?"reused":"started"} durable ${job.label||job.id}`});
+      }
       const { shell, args } = getShellInvocation(command);
 
       const child = spawn(shell, args, {
@@ -870,6 +877,13 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     },
     async ({ id, workspace, wait_for, wait_seconds }) => {
       const scope = await resolveProcessWorkspaceScope(workspace);
+      if (isDurableJobId(id)) {
+        const initial=await durableRpc<DurableJob>({action:"status",id});
+        assertDurableScope(initial,scope);
+        const wait=wait_for==="exit"?await waitDurable(id!,"exit",wait_seconds):undefined;
+        const job=await durableRpc<DurableJob>({action:"status",id});
+        return toolResult("process_status",{processes:[job],...(wait?{wait}:{})},{summary:"1 durable process"});
+      }
       let wait: { condition_met: boolean; timed_out: boolean; waited_ms: number } | undefined;
       if (wait_for === "exit") {
         if (!id) throw new Error("id is required when wait_for=exit");
@@ -908,7 +922,11 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
                 ? "silent"
                 : "active",
         }));
-      return toolResult("process_status", { processes: processes_list, ...(wait ? { wait } : {}) }, { summary: `${processes_list.length} process(es)` });
+      const durable = !id && durableJobsEnabled()
+        ? (await durableRpc<{jobs:DurableJob[]}>({action:"list"})).jobs.filter(j=>!scope.scoped||sameRoot(j.project_root,scope.projectRoot))
+        : [];
+      const all=[...processes_list,...durable];
+      return toolResult("process_status", { processes: all, ...(wait ? { wait } : {}) }, { summary: `${all.length} process(es)` });
     }
   );
 
@@ -917,7 +935,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     {
       title: "Process Operation History",
       description:
-        "Read persistent background-operation history across ChatGPT/MCP sessions and server restarts. Stale records that were running before a restart are reported as interrupted.",
+        "Read background-operation history across ChatGPT/MCP sessions and server restarts. Durable jobs retain live status; legacy in-process jobs are marked interrupted.",
       inputSchema: {
         id: z.string().optional(),
         task_id: z.string().optional(),
@@ -928,6 +946,11 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     },
     async ({ id, task_id, workspace, limit }) => {
       const scope = await resolveProcessWorkspaceScope(workspace);
+      if (isDurableJobId(id)) {
+        const job=await durableRpc<DurableJob>({action:"status",id});
+        assertDurableScope(job,scope);
+        return toolResult("process_history",{operation:{...job,effective_status:job.status}},{summary:`${job.label||job.id} — ${job.status}`});
+      }
       if (id) {
         const live = processes.get(id);
         if (live && scope.scoped && !sameRoot(live.projectRoot, scope.projectRoot)) {
@@ -957,7 +980,13 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         ...(scope.scoped ? { project_root: scope.projectRoot } : {}),
         active_ids: activeIds,
       });
-      return toolResult("process_history", { operations, count: operations.length }, { summary: `${operations.length} operation(s)` });
+      const durable = durableJobsEnabled()
+        ? (await durableRpc<{jobs:DurableJob[]}>({action:"list"})).jobs
+          .filter(j=>(!task_id||j.task_id===task_id)&&(!scope.scoped||sameRoot(j.project_root,scope.projectRoot)))
+          .map(j=>({...j,effective_status:j.status}))
+        : [];
+      const all=[...operations,...durable].sort((a,b)=>Date.parse(b.started_at)-Date.parse(a.started_at)).slice(0,limit);
+      return toolResult("process_history", { operations:all, count: all.length }, { summary: `${all.length} operation(s)` });
     }
   );
 
@@ -987,6 +1016,15 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         return toolResult("process_output", stored, { summary: `stored output ${result_handle}` });
       }
       if (!id) throw new Error("id or result_handle is required");
+      if (isDurableJobId(id)) {
+        const scope=await resolveProcessWorkspaceScope(workspace);
+        const initial=await durableRpc<DurableJob>({action:"status",id});
+        assertDurableScope(initial,scope);
+        if(wait_for==="text"&&!wait_text) throw new Error("wait_text is required when wait_for=text");
+        const wait=wait_for!=="none"?await waitDurable(id,wait_for,wait_seconds,wait_text):undefined;
+        const job=await durableRpc<DurableJob>({action:"output",id,tail_chars});
+        return toolResult("process_output",{...job,output_chars:(job.stdout||"").length+(job.stderr||"").length,output_handle:null,...(wait?{wait}:{})},{summary:`output for ${id}`});
+      }
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
       const scope = await resolveProcessWorkspaceScope(workspace);
@@ -1046,6 +1084,13 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       annotations: toolAnnotations("command"),
     },
     async ({ id, workspace, input, append_newline, close_stdin }) => {
+      if(isDurableJobId(id)){
+        const job=await durableRpc<DurableJob>({action:"status",id});
+        assertDurableScope(job,await resolveProcessWorkspaceScope(workspace),true);
+        const result=await durableRpc<{complete:boolean;bytes_written:number}>({action:"input",id,input:append_newline?input+"\n":input,close_stdin});
+        await audit({tool:"process_input",action:"input",target:job.cwd,status:result.complete?"ok":"error",details:{id,chars:input.length}});
+        return toolResult("process_input",{id,...result},{ok:result.complete,summary:result.complete?"input sent":"partial input; inspect before retrying"});
+      }
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
       await assertProcessControlScope(item, workspace);
@@ -1092,6 +1137,15 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       annotations: toolAnnotations("edit"),
     },
     async ({ id, workspace, force }) => {
+      if(isDurableJobId(id)){
+        const job=await durableRpc<DurableJob>({action:"status",id});
+        assertDurableScope(job,await resolveProcessWorkspaceScope(workspace),true);
+        await durableRpc({action:"stop",id,force});
+        await waitDurable(id,"exit",force?3:2);
+        const updated=await durableRpc<DurableJob>({action:"status",id});
+        await audit({tool:"stop_process",action:"stop",target:job.cwd,status:"ok",details:{id,force}});
+        return toolResult("stop_process",updated,{summary:updated.running?"stop requested":"stopped"});
+      }
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
       await assertProcessControlScope(item, workspace);
