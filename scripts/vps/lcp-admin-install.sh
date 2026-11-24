@@ -162,7 +162,14 @@ if [[ "$git_socket_on" == active ]]; then systemctl start "$git_socket"; fi
 if [[ "$queue_on" == active ]]; then systemctl start "$queue"; fi
 if [[ "$broker_on" == active ]]; then systemctl start "$broker"; fi
 /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-maintenance-client status
-if [[ "$broker_on" == active ]]; then /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-agent-queue-client capacity; fi
+if [[ "$broker_on" == active ]]; then
+  ready=false
+  for attempt in {1..30}; do
+    if /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-agent-queue-client capacity; then ready=true; break; fi
+    sleep 1
+  done
+  [[ "$ready" == true ]] || { echo 'Queue broker readiness timed out' >&2; exit 1; }
+fi
 if [[ "$git_socket_on" == active ]]; then /usr/sbin/runuser -u agent -- /usr/local/bin/lcp-git-push status; fi
 trap - EXIT INT TERM
 # Configure the ordinary user's native launcher only after the new host broker
