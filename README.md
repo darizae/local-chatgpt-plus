@@ -350,3 +350,7 @@ See [extended troubleshooting](docs/OPERATIONS.md#extended-troubleshooting) for 
 - [Inbound OAuth guide](docs/INBOUND_OAUTH_GUIDE.md) — implemented resource-server auth, mode switch, configuration, provider options, and ChatGPT cutover
 
 This independent project derives from MIT-licensed **ChatGPT Local Coder** by hoangcoderr. The original copyright and permission notice remain in [LICENSE](LICENSE).
+
+## Agent-assisted setup
+
+[Open the agent setup page](https://darizae.github.io/local-chatgpt-plus/) or [copy the plain-text prompt](docs/agent-setup.txt) into your coding agent. Review its proposed changes and verification results.
