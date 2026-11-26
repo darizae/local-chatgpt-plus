@@ -4,6 +4,7 @@ import { validatePath } from "../lib/path-security.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import {
+  brokerSubagentDefaults,
   clearSubagents,
   getSubagent,
   getSubagentConfig,
@@ -68,12 +69,15 @@ export function registerSubagentTool(server: McpServer, defaultCwd: string): voi
           .describe("Short polling window. Keep this brief; use repeated wait/status/output calls instead of holding one MCP request open."),
         tail_chars: z.number().int().positive().max(500000).optional().default(50000),
         isolation: z.enum(["none", "worktree"]).optional(),
+        broker_engine: z.enum(["omp", "omp-readonly"]).optional().describe("Only for the bounded VPS broker: use omp-readonly for no-tool analysis, omp for coding."),
+        broker_seconds: z.number().int().min(10).max(1800).optional().describe("VPS broker execution cap, not exceeding the configured cap."),
+        broker_cost_usd: z.number().min(0.01).max(5).optional().describe("VPS broker cost cap, not exceeding the configured cap. Requires authorized budget."),
         task_id: z.string().optional().describe("Parent agent_task id; inferred only when exactly one active task owns this repository"),
         remove_worktrees: z.boolean().optional().default(false),
       },
       annotations: toolAnnotations("command"),
     },
-    async ({ action, id, objective, workspace, label, timeout_seconds, wait_seconds, tail_chars, isolation, task_id, remove_worktrees }) => {
+    async ({ action, id, objective, workspace, label, timeout_seconds, wait_seconds, tail_chars, isolation, broker_engine, broker_seconds, broker_cost_usd, task_id, remove_worktrees }) => {
       if (action === "config") {
         const config = await getSubagentConfig();
         return toolResult("subagent", {
@@ -82,6 +86,12 @@ export function registerSubagentTool(server: McpServer, defaultCwd: string): voi
           config: { ...config, env: undefined },
           env_keys: Object.keys(config.env ?? {}),
           chatgpt_subscription_reuse: false,
+          broker: brokerSubagentDefaults(config) ? {
+            defaults: brokerSubagentDefaults(config),
+            model_selection: "server-configured; not caller-selectable",
+            isolation: "broker-owned Git worktree; use isolation=none",
+            usage: "Use this native subagent tool or lcp-agent-queue-client. Do not launch raw omp in the restricted shell. Choose omp-readonly for no-tool prompts. Use an appropriate parent timeout, allowing for queue delay.",
+          } : undefined,
         });
       }
       if (action === "list") {
@@ -122,6 +132,7 @@ export function registerSubagentTool(server: McpServer, defaultCwd: string): voi
           timeout_ms: timeout_seconds ? timeout_seconds * 1000 : undefined,
           isolation,
           task_id,
+          broker: { engine: broker_engine, seconds: broker_seconds, cost_usd: broker_cost_usd },
         });
         return toolResult("subagent", { action, agent: summarizeAgent(agent) }, { summary: `started subagent ${agent.id}` });
       }
