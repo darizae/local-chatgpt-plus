@@ -43,6 +43,18 @@ async function test(name, fn) {
   catch (error) { console.error(`FAIL ${name}: ${error?.stack || error}`); failed++; }
 }
 
+await test("VPS broker options expose bounded modes without widening operator policy", async () => {
+  const cfg = { executable: "/usr/local/bin/lcp-native-subagent", args: ["--engine", "omp", "--seconds", "900", "--cost", "1"] };
+  assert.deepEqual(subagents.brokerSubagentDefaults(cfg), { engine: "omp", seconds: 900, cost_usd: 1 });
+  assert.deepEqual(subagents.resolveBrokerSubagentArgs(cfg, { engine: "omp-readonly", seconds: 45, cost_usd: .05 }),
+    ["--engine", "omp-readonly", "--seconds", "45", "--cost", "0.05"]);
+  assert.throws(() => subagents.resolveBrokerSubagentArgs(cfg, { cost_usd: 2 }), /configured duration and cost caps/);
+  assert.throws(() => subagents.resolveBrokerSubagentArgs(cfg, { seconds: 901 }), /configured duration and cost caps/);
+  assert.throws(() => subagents.resolveBrokerSubagentArgs({ ...cfg, executable: "/usr/bin/omp" }, { seconds: 45 }), /bounded VPS/);
+  assert.throws(() => subagents.resolveBrokerSubagentArgs({ ...cfg, args: ["--engine", "omp-readonly", "--seconds", "900", "--cost", "1"] }, { engine: "omp" }), /read-only/);
+  assert.deepEqual(subagents.resolveBrokerSubagentArgs(cfg, {}), cfg.args);
+});
+
 await test("disabled subagent runner explains ChatGPT subscription boundary", async () => {
   await subagents.saveSubagentConfig({ enabled: false, executable: "", args: [] });
   await assert.rejects(

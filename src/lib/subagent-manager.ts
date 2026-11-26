@@ -35,6 +35,40 @@ export interface SubagentConfig {
   env?: Record<string, string>;
 }
 
+export interface BrokerSubagentOptions {
+  engine?: "omp" | "omp-readonly";
+  seconds?: number;
+  cost_usd?: number;
+}
+
+/** Only the installed, bounded broker supports per-job overrides. */
+export function brokerSubagentDefaults(config: SubagentConfig) {
+  if (config.executable !== "/usr/local/bin/lcp-native-subagent") return undefined;
+  const args = config.args;
+  if (args.length !== 6 || args[0] !== "--engine" || args[2] !== "--seconds" || args[4] !== "--cost") return undefined;
+  const engine = args[1];
+  const seconds = Number(args[3]), cost_usd = Number(args[5]);
+  if ((engine !== "omp" && engine !== "omp-readonly") || !Number.isInteger(seconds) ||
+      seconds < 10 || seconds > 1800 || !Number.isFinite(cost_usd) || cost_usd < 0.01 || cost_usd > 5) return undefined;
+  return { engine, seconds, cost_usd } as const;
+}
+
+export function resolveBrokerSubagentArgs(config: SubagentConfig, options?: BrokerSubagentOptions) {
+  if (!options || Object.values(options).every(value => value === undefined)) return config.args;
+  const defaults = brokerSubagentDefaults(config);
+  if (!defaults) throw new Error("Broker options require the configured bounded VPS subagent runner.");
+  const engine = options.engine ?? defaults.engine;
+  const seconds = options.seconds ?? defaults.seconds;
+  const cost = options.cost_usd ?? defaults.cost_usd;
+  if (engine !== "omp" && engine !== "omp-readonly") throw new Error("Unsupported broker engine.");
+  // A read-only-only profile cannot be upgraded to a tool-enabled profile.
+  if (defaults.engine === "omp-readonly" && engine !== "omp-readonly") throw new Error("Configured broker profile is read-only.");
+  if (!Number.isInteger(seconds) || seconds < 10 || seconds > defaults.seconds ||
+      !Number.isFinite(cost) || cost < 0.01 || cost > defaults.cost_usd)
+    throw new Error("Broker options must stay within the configured duration and cost caps.");
+  return ["--engine", engine, "--seconds", String(seconds), "--cost", String(cost)];
+}
+
 export interface SubagentRecord {
   id: string;
   label?: string;
@@ -308,6 +342,7 @@ export async function spawnSubagent(options: {
   timeout_ms?: number;
   isolation?: SubagentIsolation;
   task_id?: string;
+  broker?: BrokerSubagentOptions;
 }): Promise<SubagentRecord> {
   const config = await getSubagentConfig();
   if (!config.enabled || !config.executable) {
@@ -328,10 +363,12 @@ export async function spawnSubagent(options: {
   }
   requireSubagentRunnerAllowed(config.executable);
   const id = randomUUID().slice(0, 12);
+  const runnerArgs = resolveBrokerSubagentArgs(config, options.broker);
   const isolation = options.isolation ?? config.isolation;
+  if (brokerSubagentDefaults(config) && isolation !== "none") throw new Error("The VPS broker creates its own isolated worktree; use isolation=none.");
   const requestedWorkspace = await validatePath(options.workspace);
   const taskId = await resolveWorkerTaskId(requestedWorkspace, options.task_id);
-  requireCommandAllowed([config.executable, ...config.args].join(" "), requestedWorkspace);
+  requireCommandAllowed([config.executable, ...runnerArgs].join(" "), requestedWorkspace);
   const workspace = isolation === "worktree" ? await createWorktree(requestedWorkspace, id) : requestedWorkspace;
   const values = {
     prompt: options.objective,
@@ -339,7 +376,7 @@ export async function spawnSubagent(options: {
     id,
     label: options.label || "",
   };
-  const args = expandArgs(config.args, values);
+  const args = expandArgs(runnerArgs, values);
   try {
     requireCommandAllowed([config.executable, ...args].join(" "), workspace);
 
@@ -476,7 +513,7 @@ export async function spawnSubagent(options: {
     void terminate(record);
   }, timeoutMs);
   record.timer.unref?.();
-  const { provider, model } = extractModelFromArgs(config.args ?? []);
+  const { provider, model } = extractModelFromArgs(args);
   workerReady = registerWorker({
     id,
     source: "omp-subagent",
